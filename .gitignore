@@ -15,6 +15,7 @@ __pycache__/
 # Build artifacts
 build/
 dist/
+*.spec
 
 # Windows installer artifacts
 installer/output/
@@ -34,6 +35,8 @@ installer/naps2-v*-source.zip
 .tmp/
 *.tmp
 *.log
+/tests/.runtime-*/
+/tests/.qt-smoke-*/
 
 # Local application data (project-root folders only)
 /storage/

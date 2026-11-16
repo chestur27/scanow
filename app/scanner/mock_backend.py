@@ -1,7 +1,7 @@
 from pathlib import Path
 import threading
 from PIL import Image, ImageDraw, ImageFont
-import fitz
+import pymupdf as fitz
 from app.scanner.base import Scanner, ScanOptions, ScannerBackend, ScannerError
 
 

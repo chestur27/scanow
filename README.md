@@ -1,43 +1,65 @@
-# ScaNow
+# ScaNow 2.0
 
-ScaNow is an offline Windows desktop document scanner and PDF library. It uses Flet for the interface, NAPS2 Console for TWAIN/WIA scanning, PyMuPDF and Pillow for page editing and PDF export, and SQLite for metadata.
+ScaNow is an offline Windows document scanner and archive. The desktop interface uses PySide6 Qt Widgets and Qt PDF. NAPS2 Console continues to provide TWAIN/WIA scanning; PyMuPDF and Pillow handle page editing and PDF export. SQLite stores document metadata in `%LOCALAPPDATA%\ScaNow\library.db`. Existing settings and records are read in place and extended with new metadata columns. Managed PDFs default to `%USERPROFILE%\Documents\ScaNow\documents`.
 
-## Run from source
+## Run and test
 
-Install Python 3.11 or later, then run:
+Install Python 3.11 or later. From the repository root:
 
 ```powershell
 uv sync
 uv run python main.py
+uv run python -m unittest discover -s tests -v
+uv run python tests/smoke_qt.py
 ```
 
-The mock scanner is always listed and generates sample pages. It never reports a hardware scan. Source runs need NAPS2 Console installed separately or selected in Settings. The Windows installer bundles NAPS2; a physical scanner still needs its manufacturer's TWAIN or WIA driver. Refresh devices after changing driver installation or scanner connection.
+On a computer without NAPS2 or a physical scanner, select **Sample scanner (mock)**. Flatbed produces one page; ADF and duplex generate multiple sample pages. The real scanner requires NAPS2 Console and a manufacturer TWAIN or WIA driver. Use Settings to choose an external NAPS2 Console executable, then refresh devices.
 
-## Workflow
+## Daily workflow
 
-1. Choose a scanner, source (Flatbed, ADF, or ADF duplex), and resolution in the Scan Workspace toolbar, then click **Start Scanning**. **Scan Settings** opens the TWAIN/WIA driver, color, paper size, and deskew options; **Refresh** re-detects devices.
-2. Each job appends to the active session and the button becomes **Scan More Pages**. Keep scanning until the document is complete, then Save Document. Drag pages to reorder. Click pages to select; rotate, crop, retake, and delete from the toolbar above the preview. Undo, redo, and duplex-pair retake are in the Pages menu. A failed scan never clears previously acquired pages.
-3. Save Document to a managed library PDF or use the Windows Save dialog for another location. The custom-location checkbox controls whether the actual PDF path is registered in the library.
-4. Search and manage saved PDFs in Document Library. Open a PDF in the workspace to modify its pages. The session is preserved in local AppData after an unexpected exit.
+1. Choose a scanner, source, resolution, color, and paper size. Scan runs in a background worker. Cancel stops the active scanner job while keeping earlier pages.
+2. Select page thumbnails to rotate, crop, delete, or retake. Drag one page to reorder. Undo and redo cover page edits. Add PDF imports pages into the same recoverable session.
+3. Click **Save to archive**, enter a name and category, and optionally add a date, reference, related person or company, notes, and tags. ScaNow validates the PDF and indexes it only after the file is written. A failed save keeps the pages in the session.
+4. Use Archive library to search, filter, preview, open, export, relink, or edit documents. Removing an index entry leaves the PDF on disk. Deleting a managed PDF moves it into the archive's `documents\recovery` folder.
+   Saving edits to an existing archived PDF also keeps its prior version in a recovery folder.
+5. Use Settings to check database integrity, manage categories, and create or restore backups.
 
-User settings, metadata, logs, and recovery pages are in `%LOCALAPPDATA%\ScaNow`. Managed PDFs default to `%USERPROFILE%\Documents\ScaNow\documents`. Uninstalling the app does not remove either location.
+Unfinished pages are kept in `%LOCALAPPDATA%\ScaNow\sessions\active`. The archive and application data are outside the installation folder and are not removed by uninstalling ScaNow.
 
-## Build installer
+## Data compatibility and migration inventory
+
+| Existing component | Migration action |
+|---|---|
+| Flet shell, scan workspace, library, settings, dialogs | Replaced by Qt Widgets and Qt PDF |
+| NAPS2 discovery and scan backend | Preserved; called from Qt workers |
+| Mock scanner | Preserved |
+| Page session, recovery, edits, PDF export | Preserved and connected to Qt |
+| JSON settings | Preserved at the same path |
+| SQLite archive and categories | Preserved; added reference, entity, document date, OCR text, and checksum columns |
+| Flet Windows build | Replaced with PyInstaller onedir build |
+
+The database schema adds columns in place; it does not remove existing records. Before first use on the employee's machine, copy `%LOCALAPPDATA%\ScaNow` and the configured managed PDF folder as a separate precaution. The application does not silently move or delete either location.
+
+## Backup and restore
+
+**Create backup** writes a ZIP with a SQLite snapshot, referenced managed PDFs, and settings. It refuses to overwrite an existing ZIP and fails if a referenced managed PDF is missing. External PDF paths are retained in metadata but their files are not copied into the ZIP. **Restore backup** validates the ZIP and database, moves current managed PDFs into a timestamped recovery folder, saves the prior database as `library.before-restore-*.db`, and then installs the restored snapshot. The configured archive directory remains the target; paths from the backup's managed directory are remapped to it. Keep external documents separately backed up.
+
+## Build the Windows installer
 
 ```powershell
-uv sync --extra build
-uv run flet build windows
+.\installer\build.ps1
 .\installer\prepare_naps2.ps1
 ```
 
-Open `installer\scanow.iss` with Inno Setup 6 and compile. Verify the executable name in the generated `build\windows` folder; update `MyAppExeName` in the installer script if Flet emits a different filename. The preparation script downloads the official NAPS2 8.6.0 Windows x64 portable ZIP and matching source archive at **build time**, verifies their pinned SHA-256 checksums, and stages the entire portable runtime under `installer\payload\naps2`. The installer embeds that runtime under `{app}\tools\naps2` and the source and notices under `{app}\licenses`. Builds and installed scanning do not download dependencies at startup.
+Compile `installer\scanow.iss` with Inno Setup 6. The PyInstaller build creates `build\windows\scanow\scanow.exe`; the installer places the bundled NAPS2 runtime under `{app}\tools\naps2`. `prepare_naps2.ps1` downloads NAPS2 8.6.0 and its matching source archive at build time, verifies pinned SHA-256 hashes, and stages license notices. No download is needed at application startup. The installer uses a per-user directory and does not need administrator privileges for ordinary installation or use. NAPS2 is GPL-2.0-or-later; distribute its license, notices, and matching source archive with every installer. See `installer\NAPS2-NOTICE.txt`.
 
-The packaged app prefers `{app}\tools\naps2\App\NAPS2.Console.exe`, then a configured external path, then ordinary system locations. NAPS2 is GPL-2.0-or-later; distribute its license, notices, and complete corresponding source archive with every installer. See `installer\NAPS2-NOTICE.txt`. No HP scanner driver is bundled; obtain the manufacturer's driver separately and verify its redistribution terms before any future bundling. Scanned documents and the SQLite Document Library live outside `{app}`, so uninstalling ScaNow does not remove them.
+## Verification on the employee's Windows computer
+
+Run the automated tests above, then verify a clean installer launch on Windows 10 or 11, NAPS2 discovery, physical flatbed and ADF/duplex scans, cancellation, PDF preview, write permissions, archive persistence after restart, and backup restore. Test TWAIN/WIA behavior with the actual scanner and manufacturer driver. Confirm the bundled NAPS2 executable is found in the installed folder. This repository's automated tests use the mock scanner and do not establish physical scanner or installer behavior.
 
 ## Current limitations
 
-- Scanner capability detection is limited to driver and device discovery. Source, duplex, resolution, color, page size, and deskew are requested through NAPS2; unsupported combinations are reported by NAPS2. Blank-page removal is not exposed.
-- The preview shows the first 20 pages of a library PDF. Imported PDFs are rasterized for editing, so searchable text and vector content are not preserved through Save Changes.
-- Crop uses percentage coordinates in a dialog. Side-by-side duplex retake verification, date filters, theme selection, and automated restore are not yet implemented.
-- Backup creates a ZIP of the database and managed PDFs. Restore replaces library metadata and managed PDFs after confirmation; make a current backup first.
-- A physical scanner and packaged Windows build have not been tested in this environment.
+- Existing OCR was absent; ScaNow does not claim content search for scanned image PDFs. The database has an OCR text field for a future optional offline OCR service.
+- Opening an archived PDF in the workspace rasterizes it for editing. Saving edits can remove searchable text and vector content in the original. Export a copy first when those matter.
+- Search uses SQLite FTS5 for indexed text matches when available, with `LIKE` for substring and date/category matches.
+- The preview focuses on one page at a time. Feeder and duplex options rely on capabilities supported by the selected NAPS2 driver.

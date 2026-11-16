@@ -3,7 +3,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
-import fitz
+import pymupdf as fitz
 from PIL import Image, ImageOps
 from app.paths import app_data
 
@@ -94,6 +94,14 @@ class DocumentSession:
         self.pages.insert(new, self.pages.pop(old))
         self.persist()
 
+    def reorder_range(self, start: int, end: int, destination: int):
+        self.checkpoint()
+        moved = self.pages[start:end + 1]
+        del self.pages[start:end + 1]
+        target = destination - len(moved) if destination > start else destination
+        self.pages[target:target] = moved
+        self.persist()
+
     def rotate(self, degrees: int):
         self.checkpoint()
         for page in self.pages:
@@ -106,6 +114,26 @@ class DocumentSession:
         for page in self.pages:
             if page.id in self.selected:
                 page.crop = bounds
+        self.persist()
+
+    def crop_visible_page(self, item: PageItem, bounds: tuple[float, float, float, float]):
+        """Apply a drag rectangle on the displayed page to its original image."""
+        l, t, r, b = bounds
+        corners = ((l, t), (r, t), (l, b), (r, b))
+        def unrotate(x, y):
+            return {0: (x, y), 90: (y, 1 - x), 180: (1 - x, 1 - y),
+                    270: (1 - y, x)}[item.rotation % 360]
+        mapped = [unrotate(x, y) for x, y in corners]
+        old_l, old_t, old_r, old_b = item.crop or (0, 0, 1, 1)
+        new_bounds = (old_l + min(x for x, _ in mapped) * (old_r - old_l),
+                      old_t + min(y for _, y in mapped) * (old_b - old_t),
+                      old_l + max(x for x, _ in mapped) * (old_r - old_l),
+                      old_t + max(y for _, y in mapped) * (old_b - old_t))
+        if not (0 <= new_bounds[0] < new_bounds[2] <= 1 and
+                0 <= new_bounds[1] < new_bounds[3] <= 1):
+            raise ValueError("Choose a valid crop area.")
+        self.checkpoint()
+        item.crop = new_bounds
         self.persist()
 
     def delete(self):
