@@ -86,8 +86,10 @@ class Naps2Backend(ScannerBackend):
         args = [self.executable, "-o", str(output), "-f", "--noprofile",
                 "--driver", options.scanner.driver, "--device", options.scanner.name,
                 "--source", options.source, "--dpi", str(options.dpi),
-                "--bitdepth", options.color, "--pagesize", options.paper,
+                "--bitdepth", options.color,
                 "--number", str(number)]
+        if options.paper != "auto":
+            args.extend(("--pagesize", options.paper))
         if options.deskew:
             args.append("--deskew")
         self._canceled = False

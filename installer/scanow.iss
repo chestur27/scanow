@@ -1,5 +1,5 @@
 #define MyAppName "ScaNow"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "2.0.0"
 #define MyAppExeName "scanow.exe"
 #define Naps2Version "8.6.0"
 
@@ -14,7 +14,7 @@
 AppId={{DDE9A41B-1CE0-4E85-A785-9C642FC8B879}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-DefaultDirName={autopf}\ScaNow
+DefaultDirName={localappdata}\Programs\ScaNow
 DefaultGroupName=ScaNow
 OutputDir=output
 OutputBaseFilename=ScaNow-Setup
@@ -22,14 +22,15 @@ Compression=lzma
 SolidCompression=yes
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
-PrivilegesRequired=admin
+PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile=..\app\assets\scanow.ico
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "..\build\windows\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "..\build\windows\scanow\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "payload\naps2\*"; DestDir: "{app}\tools\naps2"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "payload\licenses\*"; DestDir: "{app}\licenses"; Flags: recursesubdirs createallsubdirs ignoreversion
 

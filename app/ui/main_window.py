@@ -1,1009 +1,1528 @@
-import asyncio
-import base64
+"""ScaNow's Qt Widgets desktop interface."""
+
 import logging
-import os
-import re
 import shutil
-import sqlite3
-import tempfile
-import uuid
-import json
-import zipfile
+from contextlib import closing
+from datetime import date
 from pathlib import Path
-import fitz
-import flet as ft
-from app.paths import app_data
-from app.settings_store import SettingsStore
-from app.scanner.base import ScanOptions, ScannerError
+
+from PySide6.QtCore import QAbstractTableModel, QBuffer, QIODevice, QModelIndex, QObject, QPointF, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, QSize
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QPixmap, QColor, QPalette
+from PySide6.QtPdf import QPdfDocument
+from PySide6.QtPdfWidgets import QPdfView
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QPlainTextEdit, QPushButton,
+    QSplitter, QStackedWidget, QTableView, QVBoxLayout, QWidget, QCheckBox, QScrollArea,
+    QGraphicsDropShadowEffect, QAbstractItemView, QHeaderView, QSizePolicy)
+
+from app.database.repository import LibraryRepository
+from app.documents.archive_service import ArchiveService, staging_directory
+from app.documents.pdf_service import export_pdf
+from app.documents.session import DocumentSession
+from app.scanner.base import ScanOptions
 from app.scanner.mock_backend import MockBackend
 from app.scanner.naps2_backend import Naps2Backend
-from app.documents.session import DocumentSession
-from app.documents.pdf_service import export_pdf
-from app.database.repository import LibraryRepository
+from app.settings_store import SettingsStore
+from app.ui.theme import stylesheet
+from app.ui.components import action, icon_button, field_label, line
+from app.ui.prompts import QMessageBox, QInputDialog
+from app.ui.crop_dialog import CropDialog
+from app.ui.smooth_scroll import SmoothPageList, SmoothPaperScroll
 
 
-logging.basicConfig(filename=app_data() / "scanow.log", level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
-INK = "#0F172A"
-MUTED = "#64748B"
-ACCENT = "#2563EB"
-SIDEBAR = "#1E293B"
-PALE = "#EFF6FF"
-BORDER = "#E2E8F0"
-BACKGROUND = "#F8FAFC"
-CONTENT = "#FFFFFF"
+def button(label, slot, primary=False):
+    return action(label, slot, primary=primary)
 
 
-def option(key, label=None):
-    return ft.DropdownOption(key=str(key), text=str(label if label is not None else key))
+def combo(options, value=None):
+    control = QComboBox()
+    for label, data in options:
+        control.addItem(label, data)
+    index = control.findData(value)
+    if index >= 0:
+        control.setCurrentIndex(index)
+    return control
 
 
-def title(text, size=22):
-    return ft.Text(text, size=size, weight=ft.FontWeight.BOLD, color=INK)
+def heading(text, subtle=False):
+    label = QLabel(text)
+    label.setObjectName("subtle" if subtle else "title")
+    return label
 
 
-def quiet_button_style():
-    return ft.ButtonStyle(color=INK, bgcolor=CONTENT,
-        shape=ft.RoundedRectangleBorder(radius=7),
-        side=ft.BorderSide(1, BORDER))
+class JobSignals(QObject):
+    done = Signal(object)
+    failed = Signal(str)
 
 
-class ScaNowApp:
-    def __init__(self, page: ft.Page):
-        self.page = page
-        self.page.title = "ScaNow"
-        self.page.theme_mode = ft.ThemeMode.LIGHT
-        self.page.theme = ft.Theme(
-            color_scheme_seed=ACCENT,
-            color_scheme=ft.ColorScheme(primary=ACCENT, on_primary=CONTENT,
-                secondary=SIDEBAR, surface=CONTENT, on_surface=INK,
-                on_surface_variant=MUTED, outline=BORDER),
-            font_family="Segoe UI", scaffold_bgcolor=BACKGROUND,
-            canvas_color=BACKGROUND, dialog_theme=ft.DialogTheme(bgcolor=CONTENT),
-            input_decoration_theme=ft.InputDecorationTheme(
-                border=ft.OutlineInputBorder(side=ft.BorderSide(1, BORDER), border_radius=7),
-                filled=True, fill_color=CONTENT))
-        self.page.window.width = 1320
-        self.page.window.height = 700
-        self.page.window.min_width = 1080
-        self.page.window.min_height = 620
-        self.page.bgcolor = BACKGROUND
-        self.page.padding = 0
+class Job(QRunnable):
+    def __init__(self, operation):
+        super().__init__()
+        self.operation = operation
+        self.signals = JobSignals()
+
+    def run(self):
+        try:
+            self.signals.done.emit(self.operation())
+        except Exception as exc:
+            logging.exception("Background operation failed")
+            self.signals.failed.emit(str(exc))
+
+
+class MetadataDialog(QDialog):
+    def __init__(self, library, record=None, parent=None, draft=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit details" if record else "Save to Archive")
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet("QDialog { background: transparent; }")
+        self.setFixedWidth(600)
+        self.record = record
+        self._overlay = None
+        source = record or draft or {}
+        def val(key, default=""):
+            return source[key] if key in source.keys() else default
+        frame = QFrame()
+        frame.setObjectName("modalCard")
+        shadow = QGraphicsDropShadowEffect(frame)
+        shadow.setBlurRadius(32)
+        shadow.setOffset(0, 12)
+        shadow.setColor(QColor(31, 41, 61, 65))
+        frame.setGraphicsEffect(shadow)
+        wrap = QVBoxLayout(self)
+        wrap.setContentsMargins(18, 18, 18, 18)
+        wrap.addWidget(frame)
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(24, 20, 24, 20)
+        outer.setSpacing(8)
+        outer.addWidget(heading("Edit details" if record else "Save to Archive"))
+        count = len(parent.session.pages) if parent else 0
+        subtitle = heading("Update searchable document details." if record else
+                           f"{count} {'page' if count == 1 else 'pages'} · added to your library and searchable.", True)
+        outer.addWidget(subtitle)
+        outer.addSpacing(4)
+        outer.addWidget(field_label("Document name *"))
+        self.title_edit = QLineEdit(val("title", "Untitled scan"))
+        outer.addWidget(self.title_edit)
+        self.name_error = QLabel("")
+        self.name_error.setObjectName("error")
+        self.name_error.hide()
+        outer.addWidget(self.name_error)
+        columns = QHBoxLayout()
+        columns.setSpacing(10)
+        category_box = QVBoxLayout()
+        category_box.setSpacing(4)
+        category_box.addWidget(field_label("Category *"))
+        self.category = combo([(r["name"], r["id"]) for r in library.categories()],
+                              val("category_id", 1))
+        self.category.addItem("+ Add category…", None)
+        self.category.currentIndexChanged.connect(self.add_category_if_requested)
+        self.library = library
+        category_row = QHBoxLayout()
+        category_row.setSpacing(4)
+        category_row.addWidget(self.category, 1)
+        category_row.addWidget(icon_button("plus", self.create_category, "Add category"))
+        category_box.addLayout(category_row)
+        columns.addLayout(category_box, 1)
+        date_box = QVBoxLayout()
+        date_box.setSpacing(4)
+        date_box.addWidget(field_label("Document date *"))
+        self.date_edit = QLineEdit(val("document_date") or date.today().isoformat())
+        self.date_edit.setPlaceholderText("YYYY-MM-DD")
+        date_box.addWidget(self.date_edit)
+        columns.addLayout(date_box, 1)
+        outer.addLayout(columns)
+        if not record:
+            outer.addWidget(field_label("Save PDF in folder *"))
+            folder_row = QHBoxLayout()
+            default_folder = str(Path(parent.settings.get("library_dir")) / "documents") if parent else ""
+            self.folder_edit = QLineEdit(val("destination_dir", default_folder))
+            folder_row.addWidget(self.folder_edit, 1)
+            folder_row.addWidget(action("Browse…", self.browse_folder))
+            outer.addLayout(folder_row)
+        else:
+            self.folder_edit = None
+        self.date_error = QLabel("")
+        self.date_error.setObjectName("error")
+        self.date_error.hide()
+        outer.addWidget(self.date_error)
+        self.reference = QLineEdit(val("reference_number"))
+        self.entity = QLineEdit(val("related_entity"))
+        self.notes = QPlainTextEdit(val("description"))
+        self.tags = QLineEdit(val("tags"))
+        if record:
+            details = QFormLayout()
+            self.notes.setFixedHeight(60)
+            details.addRow("Reference", self.reference)
+            details.addRow("Person or company", self.entity)
+            details.addRow("Notes", self.notes)
+            details.addRow("Tags", self.tags)
+            outer.addLayout(details)
+        outer.addSpacing(12)
+        controls = QHBoxLayout()
+        controls.addStretch()
+        controls.addWidget(action("Cancel  Esc", self.reject))
+        save = action("Save  Ctrl+↵", self.validate, primary=True)
+        controls.addWidget(save)
+        outer.addLayout(controls)
+        shortcut = QAction(self)
+        shortcut.setShortcut(QKeySequence("Ctrl+Return"))
+        shortcut.triggered.connect(self.validate)
+        self.addAction(shortcut)
+
+    def browse_folder(self):
+        chosen = QFileDialog.getExistingDirectory(self, "Choose archive folder", self.folder_edit.text())
+        if chosen:
+            self.folder_edit.setText(chosen)
+
+    def add_category_if_requested(self):
+        if self.category.currentData() is not None:
+            return
+        self.create_category()
+
+    def create_category(self):
+        name, accepted = QInputDialog.getText(self, "Add category", "Category name:")
+        if accepted and name.strip():
+            try:
+                self.library.add_category(name.strip())
+                self.category.blockSignals(True)
+                self.category.clear()
+                for row in self.library.categories():
+                    self.category.addItem(row["name"], row["id"])
+                self.category.addItem("+ Add category…", None)
+                self.category.setCurrentIndex(self.category.findText(name.strip()))
+                self.category.blockSignals(False)
+                parent = self.parentWidget()
+                if parent and hasattr(parent, "category_filter"):
+                    parent.category_filter.addItem(name.strip(), self.category.currentData())
+                return
+            except Exception as exc:
+                QMessageBox.warning(self, "Category", str(exc))
+        self.category.setCurrentIndex(0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        parent = self.parentWidget()
+        if parent and isinstance(parent, QMainWindow):
+            self._overlay = QFrame(parent.centralWidget())
+            self._overlay.setGeometry(parent.centralWidget().rect())
+            self._overlay.setStyleSheet("background:rgba(40,48,70,70);")
+            self._overlay.show()
+            self._overlay.raise_()
+            center = parent.mapToGlobal(parent.rect().center())
+            self.move(center.x() - self.width() // 2, center.y() - self.height() // 2)
+
+    def done(self, result):
+        if self._overlay:
+            self._overlay.deleteLater()
+            self._overlay = None
+        super().done(result)
+
+    def validate(self):
+        name = self.title_edit.text().strip()
+        self.name_error.setText("Enter a valid document name." if not name or any(c in name for c in '<>:"/\\|?*') else "")
+        self.name_error.setVisible(bool(self.name_error.text()))
+        try:
+            date.fromisoformat(self.date_edit.text().strip())
+            self.date_error.setText("")
+        except ValueError:
+            self.date_error.setText("Enter a date as YYYY-MM-DD.")
+        self.date_error.setVisible(bool(self.date_error.text()))
+        if self.folder_edit is not None and not self.folder_edit.text().strip():
+            self.date_error.setText("Choose a folder for the archived PDF.")
+            self.date_error.show()
+        if self.name_error.text() or self.date_error.text():
+            (self.title_edit if self.name_error.text() else self.date_edit).setFocus()
+            return
+        self.accept()
+
+    def values(self):
+        return dict(title=self.title_edit.text().strip(), category_id=self.category.currentData(),
+                    document_date=self.date_edit.text().strip(), reference_number=self.reference.text().strip(),
+                    related_entity=self.entity.text().strip(), description=self.notes.toPlainText().strip(),
+                    tags=self.tags.text().strip(),
+                    destination_dir=self.folder_edit.text().strip() if self.folder_edit else "")
+
+
+class DocumentModel(QAbstractTableModel):
+    columns = ("Date ↓", "Name", "Category")
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def set_records(self, records):
+        self.beginResetModel()
+        self.records = list(records)
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.records)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.columns)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.columns[section]
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        r = self.records[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            raw_date = r["document_date"] or r["created_at"][:10]
+            try:
+                readable_date = date.fromisoformat(raw_date).strftime("%b %d, %Y")
+            except ValueError:
+                readable_date = raw_date
+            return (readable_date, r["title"], r["category"])[index.column()]
+        if role == Qt.ItemDataRole.FontRole and index.column() == 1:
+            from PySide6.QtGui import QFont
+            font = QFont("Arial", 10)
+            font.setWeight(QFont.Weight.DemiBold)
+            return font
+        return None
+
+
+class ScaNowWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
         self.settings = SettingsStore()
         self.library = LibraryRepository()
+        self.archive = ArchiveService(self.library, self.settings)
         self.session = DocumentSession()
         self.mock = MockBackend()
         self.naps2 = Naps2Backend(self.settings.get("naps2_path"))
-        self.scanners = []
-        self.busy = False
-        self._discovering = False
-        self._active_backend = None
-        self.active_page_id = None
-        self.active_view = "scan"
-        self.sidebar_expanded = True
-        self.gallery = ft.ReorderableListView(expand=True, spacing=8, on_reorder=self.reorder)
-        self.preview = ft.Container(expand=True, alignment=ft.Alignment.CENTER)
-        self.status = ft.Text("Ready", color=MUTED, size=12)
-        self.body = ft.Container(expand=True, padding=ft.Padding(16, 12, 16, 10))
-        self.nav = {}
+        self.pool = QThreadPool.globalInstance()
+        self.jobs = set()
+        self.scanners = self.mock.discover()
+        self.running = False
+        self.active_backend = None
+        self.current_page = 0
+        self.preview_request = 0
+        self.pending_metadata = None
+        self.preview_cache = {}
+        self.setWindowTitle("ScaNow 2.0")
+        available = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1366, available.width()), min(768, available.height()))
+        self.setMinimumSize(940, 600)
+        self.setStyleSheet(stylesheet(self.settings.get("theme")))
         self._build_shell()
+        self._build_scan()
+        self._build_library()
+        self._build_settings()
+        self._shortcuts()
+        self.show_view(0)
+        self.refresh_pages()
         self.refresh_scanners()
-        self.show_scan()
         if self.session.pages:
             self.message(f"Recovered {len(self.session.pages)} unsaved page(s).")
 
     def _build_shell(self):
-        self.sidebar = ft.Column(spacing=4)
-        self.sidebar_container = ft.Container(content=self.sidebar, width=200, bgcolor=SIDEBAR,
-                                              padding=ft.Padding(8, 8, 8, 8))
-        self._render_sidebar()
-        self.page.add(ft.Row(expand=True, spacing=0, controls=[
-            self.sidebar_container,
-            ft.Column(expand=True, spacing=0, controls=[self.body,
-                ft.Container(content=self.status, bgcolor=CONTENT,
-                             border=ft.Border(top=ft.BorderSide(1, BORDER)),
-                             padding=ft.Padding(20, 7, 12, 7))])]))
+        root = QWidget()
+        layout = QHBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        rail = QFrame()
+        rail.setObjectName("rail")
+        rail.setFixedWidth(56)
+        nav = QVBoxLayout(rail)
+        nav.setContentsMargins(8, 9, 8, 24)
+        nav.setSpacing(5)
+        self.nav_buttons = []
+        for index, (name, label) in enumerate((("scan", "Scan workspace"), ("archive", "Archive library"))):
+            item = icon_button(name, lambda i=index: self.show_view(i), label, nav=True)
+            nav.addWidget(item)
+            self.nav_buttons.append(item)
+        nav.addStretch()
+        item = icon_button("settings", lambda: self.show_view(2), "Settings", nav=True)
+        nav.addWidget(item)
+        self.nav_buttons.append(item)
+        self.stack = QStackedWidget()
+        layout.addWidget(rail)
+        layout.addWidget(self.stack, 1)
+        self.setCentralWidget(root)
+        self.statusBar().showMessage("Ready")
 
-    def _render_sidebar(self):
-        self.sidebar.controls.clear()
-        self.nav.clear()
-        expanded = self.sidebar_expanded
-        self.sidebar_container.width = 200 if expanded else 68
-        self.sidebar.controls.append(ft.Row(controls=[
-            ft.Column(spacing=0, expand=True, controls=[
-                ft.Text("ScaNow", size=26, weight=ft.FontWeight.BOLD, color="white"),
-                ft.Text("DOCUMENT STUDIO", size=10, color="#CBD5E1")]) if expanded else ft.Container(expand=True),
-            ft.IconButton(icon=ft.Icons.CHEVRON_LEFT if expanded else ft.Icons.CHEVRON_RIGHT,
-                          icon_color="white", tooltip="Collapse sidebar" if expanded else "Expand sidebar",
-                          on_click=lambda e: self.toggle_sidebar())]))
-        self.sidebar.controls.append(ft.Container(height=22))
-        for key, label, icon, handler in [
-            ("scan", "Scan Workspace", ft.Icons.DOCUMENT_SCANNER, self.show_scan),
-            ("library", "Document Library", ft.Icons.FOLDER_OPEN, self.show_library),
-            ("settings", "Settings", ft.Icons.SETTINGS, self.show_settings)]:
-            button = ft.TextButton(label if expanded else None, icon=icon,
-                                   tooltip=label, on_click=lambda e, f=handler: f(),
-                                   width=176 if expanded else 52,
-                                   style=ft.ButtonStyle(color="white", bgcolor=ACCENT if key == self.active_view else SIDEBAR,
-                                       shape=ft.RoundedRectangleBorder(radius=8)))
-            self.nav[key] = button
-            self.sidebar.controls.append(button)
-        self.sidebar.controls.append(ft.Container(expand=True))
-        if expanded:
-            self.sidebar.controls.append(ft.Container(
-                content=ft.Text("OFFLINE  •  PRIVATE", size=10, color="#CBD5E1"), padding=12))
-
-    def toggle_sidebar(self):
-        self.sidebar_expanded = not self.sidebar_expanded
-        self._render_sidebar()
-        self.page.update()
+    def _shortcuts(self):
+        for text, key, slot in (("Scan", "Ctrl+Shift+S", self.start_scan),
+                                 ("Save to archive", "Ctrl+S", self.save_document),
+                                 ("New document", "Ctrl+N", self.new_document),
+                                 ("Find documents", "Ctrl+F", self.focus_search)):
+            action = QAction(text, self)
+            action.setShortcut(QKeySequence(key))
+            action.triggered.connect(lambda checked=False, handler=slot: handler())
+            self.addAction(action)
 
     def message(self, text, error=False):
-        self.status.value = text
-        self.status.color = "#B63B36" if error else MUTED
-        self.page.update()
+        self.statusBar().showMessage(text, 12000 if error else 8000)
+        if error:
+            QMessageBox.warning(self, "ScaNow", text)
 
-    def dialog(self, heading, content, actions):
-        self.page.show_dialog(ft.AlertDialog(title=title(heading, 18), content=content,
-                                             actions=actions, modal=True))
+    def run_job(self, operation, success, failure=None):
+        job = Job(operation)
+        job.setAutoDelete(False)
+        self.jobs.add(job)
+        def complete(result):
+            try:
+                success(result)
+            finally:
+                self.jobs.discard(job)
+        def fail(error):
+            try:
+                (failure or (lambda text: self.message(text, True)))(error)
+            finally:
+                self.jobs.discard(job)
+        job.signals.done.connect(complete)
+        job.signals.failed.connect(fail)
+        self.pool.start(job)
 
-    def close_dialog(self):
-        self.page.pop_dialog()
+    def show_view(self, index):
+        self.stack.setCurrentIndex(index)
+        for number, control in enumerate(self.nav_buttons):
+            control.setProperty("active", number == index)
+            control.style().unpolish(control)
+            control.style().polish(control)
+        if index == 1:
+            self.refresh_library()
 
-    def confirm(self, heading, text, action):
-        def run(e):
-            self.close_dialog()
-            action()
-        self.dialog(heading, ft.Text(text), [ft.TextButton("Cancel", on_click=lambda e: self.close_dialog()),
-                                           ft.Button("Continue", on_click=run)])
+    def focus_search(self):
+        self.show_view(1)
+        self.search.setFocus()
 
-    def switch(self, key, content):
-        self.active_view = key
-        self.body.content = content
-        for name, button in self.nav.items():
-            button.style = ft.ButtonStyle(color="white", bgcolor=ACCENT if name == key else SIDEBAR,
-                                          shape=ft.RoundedRectangleBorder(radius=8))
-        self.page.update()
+    def remember_scanner(self):
+        if self.scanner_select.currentData():
+            self.settings.set(default_scanner=self.scanner_select.currentData())
 
     def refresh_scanners(self):
-        if self._discovering:
+        if self.running:
             return
-        self._discovering = True
-        self.message("Searching for scanners…")
-        asyncio.create_task(self._discover_scanners())
+        self.scan_status.setText("Searching for scanners…")
+        self.statusBar().showMessage("Searching for scanners…")
+        driver = self.settings.get("driver")
+        drivers = (driver,) if driver in ("twain", "wia") else ("twain", "wia")
+        self.run_job(lambda: self.naps2.discover(drivers), self._scanners_found)
 
-    async def _discover_scanners(self):
-        drivers = self._driver_preference()
-        try:
-            found = await asyncio.to_thread(self.naps2.discover, drivers)
-        except Exception:
-            logging.exception("Scanner discovery failed")
-            found = []
-        finally:
-            self._discovering = False
-        # TWAIN is queried first, so a device exposed by both drivers keeps TWAIN.
-        pool = self.mock.discover() + found
-        seen = set()
-        self.scanners = []
-        for scanner in pool:
-            if scanner.name.lower() in seen:
-                continue
-            seen.add(scanner.name.lower())
-            self.scanners.append(scanner)
-        self._apply_scanner_options()
-        real = [s for s in self.scanners if not s.mock]
-        if real:
-            self.message(f"Found {len(real)} scanner device(s). Ready to scan.")
-        elif self.naps2.diagnostic == "engine_missing":
-            self.message("NAPS2 scanning engine is missing. Reinstall ScaNow or set its Console path in Settings. "
-                         "Mock scanning remains available.", True)
-        elif self.naps2.diagnostic == "driver_missing":
-            self.message("No TWAIN/WIA scanner driver is available. Install the scanner manufacturer's driver, "
-                         "then click Refresh. Mock scanning remains available.", True)
-        elif self.naps2.diagnostic == "engine_error":
-            self.message("NAPS2 could not query scanner drivers. Check its runtime and driver installation, "
-                         "then click Refresh. Mock scanning remains available.", True)
-        else:
-            self.message("No physical scanner detected. Check power, connection, and driver installation, "
-                         "then click Refresh. Mock scanning remains available.")
-
-    def _driver_preference(self):
-        driver = str(self.settings.get("driver") or "auto").lower()
-        return (driver,) if driver in ("twain", "wia") else ("twain", "wia")
-
-    def _apply_scanner_options(self):
-        driver = str(self.settings.get("driver") or "auto").lower()
-        pool = [s for s in self.scanners if not s.mock and (driver == "auto" or s.driver == driver)]
-        pool += [s for s in self.scanners if s.mock]
-        if not hasattr(self, "scanner_select"):
-            return
-        self.scanner_select.options = [option(f"{s.driver}|{s.name}", self._scanner_label(s)) for s in pool]
-        keys = [o.key for o in self.scanner_select.options]
+    def _scanners_found(self, discovered):
+        unique = {}
+        for scanner in discovered + self.mock.discover():
+            unique.setdefault(scanner.name.lower(), scanner)
+        self.scanners = list(unique.values())
         preferred = self.settings.get("default_scanner")
-        if preferred in keys:
-            self.scanner_select.value = preferred
-        elif self.scanner_select.value not in keys or self.scanner_select.value.startswith("mock|"):
-            self.scanner_select.value = keys[0] if keys else None
-        self.page.update()
-
-    @staticmethod
-    def _scanner_label(scanner):
-        if scanner.mock:
-            return "Mock scanner (sample pages)"
-        return f"{scanner.name}  ({scanner.driver.upper()})"
+        self.scanner_select.blockSignals(True)
+        self.scanner_select.clear()
+        for scanner in self.scanners:
+            self.scanner_select.addItem(f"{scanner.name} ({scanner.driver.upper()})", f"{scanner.driver}|{scanner.name}")
+        selected = self.scanner_select.findData(preferred)
+        self.scanner_select.setCurrentIndex(max(0, selected))
+        self.scanner_select.blockSignals(False)
+        count = sum(not scanner.mock for scanner in self.scanners)
+        self.scan_status.setText(f"{count} physical scanner(s) ready" if count else "Mock scanner ready · No physical scanner detected")
+        self.scanner_status_dot.setStyleSheet("color:#19965D; font-size:11pt" if self.scanners else
+                                              "color:#C9362C; font-size:11pt")
+        self.scanner_select.setToolTip(self.scan_status.text())
+        self.statusBar().showMessage(self.scan_status.text(), 8000)
 
     def selected_scanner(self):
-        if not getattr(self, "scanner_select", None) or not self.scanner_select.value:
-            return None
-        return next((s for s in self.scanners if f"{s.driver}|{s.name}" == self.scanner_select.value), None)
+        key = self.scanner_select.currentData()
+        return next((s for s in self.scanners if f"{s.driver}|{s.name}" == key), None)
 
-    def show_scan(self):
-        self.scanner_select = ft.Dropdown(label="Selected Scanner", width=285, dense=True,
-            options=[option(f"{s.driver}|{s.name}", self._scanner_label(s)) for s in self.scanners],
-            value=self.settings.get("default_scanner") if self.settings.get("default_scanner") in
-                  [f"{s.driver}|{s.name}" for s in self.scanners] else None,
-            on_select=lambda e: self.settings.set(default_scanner=self.scanner_select.value))
-        self.source = ft.Dropdown(label="Scan Source", width=145, dense=True, value=self.settings.get("source"),
-            options=[option("glass", "Flatbed"), option("feeder", "ADF"), option("duplex", "ADF duplex")])
-        self.dpi = ft.Dropdown(label="Resolution", width=120, dense=True, value=str(self.settings.get("dpi")),
-            options=[option(i, f"{i} dpi") for i in (150, 200, 300, 600)])
-        self.driver_select = ft.Dropdown(label="Driver", width=130, value=self.settings.get("driver"),
-            options=[option("auto", "Auto"), option("twain", "TWAIN"), option("wia", "WIA")],
-            on_select=lambda e: self.on_driver_change())
-        self.color = ft.Dropdown(label="Color", width=145, value=self.settings.get("color"),
-            options=[option("color", "Color"), option("gray", "Grayscale"), option("bw", "B&W")])
-        self.paper = ft.Dropdown(label="Paper", width=120, value=self.settings.get("paper"),
-            options=[option("a4", "A4"), option("letter", "Letter"), option("legal", "Legal")])
-        self.deskew = ft.Checkbox(label="Deskew", value=self.settings.get("deskew"))
-        self.scan_button = ft.Button("Scan More Pages" if self.session.pages else "Start Scanning",
-            icon=ft.Icons.DOCUMENT_SCANNER, style=ft.ButtonStyle(bgcolor=ACCENT, color="white"),
-            on_click=lambda e: self.start_scan_primary())
-        self.scan_progress = ft.ProgressRing(width=18, height=18, stroke_width=2.5, visible=False)
-        self.cancel_button = ft.TextButton("Cancel", tooltip="Cancel the running scan",
-            visible=self.busy, on_click=lambda e: self.cancel_scan())
-        self.settings_button = ft.TextButton("Scan Settings", icon=ft.Icons.TUNE,
-            tooltip="Driver, color, paper size, and deskew settings",
-            style=quiet_button_style(),
-            on_click=lambda e: self.open_scan_setup())
-        self.refresh_button = ft.TextButton("Refresh", icon=ft.Icons.REFRESH,
-            style=quiet_button_style(),
-            tooltip="Find connected scanners", on_click=lambda e: self.refresh_scanners())
-        scanner_toolbar = ft.Container(bgcolor=CONTENT, border=ft.Border.all(1, BORDER),
-            border_radius=8, padding=ft.Padding(10, 6, 10, 6), content=ft.Row(
-                wrap=True, spacing=10, run_spacing=8, controls=[
-                    self.scan_button, self.scan_progress, self.cancel_button,
-                    self.scanner_select, self.source, self.dpi,
-                    self.settings_button, self.refresh_button]))
-        self.gallery = ft.ReorderableListView(expand=True, spacing=8, on_reorder=self.reorder)
-        self.page_count = ft.Text(f"({len(self.session.pages)})", color=MUTED, size=13)
-        self.page_menu = ft.PopupMenuButton(icon=ft.Icons.MORE_HORIZ, tooltip="Page options",
-            items=[ft.PopupMenuItem(content="Undo", on_click=lambda e: self.history(True)),
-                   ft.PopupMenuItem(content="Redo", on_click=lambda e: self.history(False)),
-                   ft.PopupMenuItem(content="Retake duplex pair", on_click=lambda e: self.retake(True))])
-        gallery_panel = ft.Container(width=178, bgcolor=CONTENT, border=ft.Border.all(1, BORDER),
-            border_radius=8, padding=ft.Padding(8, 8, 8, 8), content=ft.Column(
-                expand=True, spacing=4, controls=[
-                    ft.Row(spacing=3, controls=[title("Pages", 16), self.page_count,
-                                                ft.Container(expand=True), self.page_menu]),
-                    self.gallery]))
-        self.edit_buttons = [
-            ft.TextButton("Rotate Left", icon=ft.Icons.ROTATE_LEFT, tooltip="Rotate selected page left",
-                          style=quiet_button_style(), expand=1, on_click=lambda e: self.edit_rotate(-90)),
-            ft.TextButton("Rotate Right", icon=ft.Icons.ROTATE_RIGHT, tooltip="Rotate selected page right",
-                          style=quiet_button_style(), expand=1, on_click=lambda e: self.edit_rotate(90)),
-            ft.TextButton("Crop", icon=ft.Icons.CROP, tooltip="Crop selected page",
-                          style=quiet_button_style(), expand=1, on_click=self.crop_dialog),
-            ft.TextButton("Retake", icon=ft.Icons.REPLAY, tooltip="Rescan selected page",
-                          style=quiet_button_style(), expand=1, on_click=lambda e: self.retake(False)),
-            ft.TextButton("Delete", icon=ft.Icons.DELETE_OUTLINE, tooltip="Delete selected page",
-                          style=quiet_button_style(), expand=1, on_click=lambda e: self.edit_delete()),
-        ]
-        edit_toolbar = ft.Container(bgcolor=CONTENT, border=ft.Border.all(1, BORDER),
-            border_radius=8, padding=ft.Padding(4, 2, 4, 2),
-            content=ft.Row(spacing=4, controls=self.edit_buttons))
-        self.preview = ft.Container(expand=True, bgcolor="#E8EEF5", alignment=ft.Alignment.CENTER)
-        self.zoom_label = ft.Text("100%", color=INK, weight=ft.FontWeight.BOLD, size=12)
-        self.zoom_controls = ft.Row(spacing=4, alignment=ft.MainAxisAlignment.CENTER, controls=[
-            ft.IconButton(icon=ft.Icons.REMOVE, tooltip="Zoom out", on_click=lambda e: asyncio.create_task(self.zoom(0.8))),
-            ft.Container(width=52, alignment=ft.Alignment.CENTER, content=self.zoom_label),
-            ft.IconButton(icon=ft.Icons.ADD, tooltip="Zoom in", on_click=lambda e: asyncio.create_task(self.zoom(1.25))),
-            ft.Container(width=1, height=22, bgcolor=BORDER),
-            ft.TextButton("Fit to Page", icon=ft.Icons.FIT_SCREEN, tooltip="Fit document to preview",
-                          on_click=lambda e: asyncio.create_task(self.fit())),
-            ft.TextButton("Reset", icon=ft.Icons.RESTART_ALT, tooltip="Reset zoom and position",
-                          on_click=lambda e: asyncio.create_task(self.fit()))])
-        zoom_bar = ft.Container(bgcolor=CONTENT,
-            border=ft.Border(top=ft.BorderSide(1, BORDER)),
-            padding=ft.Padding(4, 0, 4, 0), content=self.zoom_controls)
-        preview_frame = ft.Container(expand=True, bgcolor="#E8EEF5",
-            border=ft.Border.all(1, BORDER), border_radius=8,
-            content=ft.Column(expand=True, spacing=0, controls=[self.preview, zoom_bar]))
-        self.document_status = ft.Text("", color=INK, size=12, expand=True,
-                                       no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS)
-        self.page_status = ft.Text("", color=MUTED, size=12)
-        preview_area = ft.Column(expand=True, spacing=6, controls=[edit_toolbar, preview_frame,
-            ft.Row(controls=[self.document_status, self.page_status])])
-        self.switch("scan", ft.Column(expand=True, spacing=10, controls=[
-            ft.Row(controls=[title("Scan Workspace"), ft.Container(expand=True),
-                ft.TextButton("New Document", icon=ft.Icons.NOTE_ADD_OUTLINED,
-                              on_click=lambda e: self.new_document()),
-                ft.TextButton("Save As", on_click=lambda e: self.save_dialog(save_as=True)) if self.session.source_document_id else ft.Container(),
-                ft.Button("Save Document", icon=ft.Icons.SAVE,
-                          style=ft.ButtonStyle(bgcolor=ACCENT, color="white"), on_click=self.save_dialog)]),
-            scanner_toolbar,
-            ft.Row(expand=True, spacing=10, vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-                   controls=[gallery_panel, preview_area])]))
-        if self.busy:
-            self._set_scan_ui(True)
-        self.refresh_pages()
-
-    def open_scan_setup(self, at=None, replace=0, pair=False):
-        if self.busy:
-            self.message("A scan is already running.", True)
-            return
-        if replace == 1:
-            self.source.value = "glass"
-        elif pair:
-            self.source.value = "duplex"
-        def start(e):
-            if not self.selected_scanner():
-                self.message("Select a scanner first. If none are listed, click Refresh.", True)
-                return
-            self.close_dialog()
-            self.page.update()
-            asyncio.create_task(self.scan(at=at, replace=replace, pair=pair))
-        self.dialog("Scan setup", ft.Column(width=440, tight=True, spacing=10, controls=[
-            ft.Text("Choose the scanner, source, and resolution on the toolbar.", color=MUTED),
-            ft.Row(controls=[self.driver_select,
-                             ft.TextButton("Refresh scanners", icon=ft.Icons.REFRESH,
-                                           on_click=lambda e: self.refresh_scanners())]),
-            ft.Row(controls=[self.color, self.paper, self.deskew]),
-            ft.Text("TWAIN is preferred when available; switch to WIA if the device is not listed. "
-                    "The mock scanner generates sample pages without hardware.", color=MUTED, size=11)
-        ]), [ft.TextButton("Cancel", on_click=lambda e: self.close_dialog()),
-             ft.Button("Start scanning", icon=ft.Icons.DOCUMENT_SCANNER,
-                       style=ft.ButtonStyle(bgcolor=ACCENT, color="white"), on_click=start)])
-
-    def refresh_pages(self):
-        self.session.selected.intersection_update(p.id for p in self.session.pages)
-        self.page_count.value = f"({len(self.session.pages)})"
-        self.gallery.controls.clear()
-        for index, item in enumerate(self.session.pages):
-            try:
-                thumb_src = base64.b64encode(self.session.preview_path(item, 150).read_bytes()).decode("ascii")
-                thumb = ft.Image(src=thumb_src, width=66, height=82, fit=ft.BoxFit.CONTAIN)
-            except (OSError, ValueError):
-                logging.exception("Could not render page thumbnail")
-                thumb = ft.Icon(ft.Icons.INSERT_DRIVE_FILE, color=ACCENT, size=42)
-            selected_page = item.id in self.session.selected
-            self.gallery.controls.append(ft.Container(key=item.id, border_radius=7,
-                bgcolor=PALE if selected_page else CONTENT,
-                border=ft.Border.all(2 if selected_page else 1, ACCENT if selected_page else BORDER),
-                padding=5, content=ft.Row(spacing=6, controls=[thumb,
-                    ft.Text(f"Page {index + 1}", weight=ft.FontWeight.BOLD,
-                            color=ACCENT if selected_page else INK, size=11)]),
-                on_click=lambda e, id=item.id: self.select_page(id)))
-        selected = next((p for p in self.session.pages
-                         if p.id == self.active_page_id and p.id in self.session.selected), None)
-        if selected is None:
-            selected = next((p for p in self.session.pages if p.id in self.session.selected), None)
-        if selected is None:
-            selected = next((p for p in self.session.pages if p.id == self.active_page_id), None)
-        if selected is None and self.session.pages:
-            selected = self.session.pages[0]
-        can_edit = bool(self.session.selected) and not self.busy
-        for button in self.edit_buttons:
-            button.disabled = not can_edit
-        self.page_menu.items[0].disabled = not bool(self.session._undo)
-        self.page_menu.items[1].disabled = not bool(self.session._redo)
-        self.page_menu.items[2].disabled = not can_edit
-        self.zoom_controls.disabled = selected is None
-        document = self.library.get(self.session.source_document_id) if self.session.source_document_id else None
-        document_name = document["title"] if document else "New Document"
-        self.document_status.value = f"Document: {document_name} ({len(self.session.pages)} pages)"
-        self.page_status.value = (f"Page {self.session.pages.index(selected) + 1} of {len(self.session.pages)}"
-                                  if selected else "No page selected")
-        self.viewer = None
-        self.zoom_label.value = "100%"
-        if selected:
-            try:
-                image_src = base64.b64encode(self.session.preview_path(selected).read_bytes()).decode("ascii")
-                self.viewer = ft.InteractiveViewer(min_scale=0.5, max_scale=5,
-                    boundary_margin=ft.Margin.all(100),
-                    on_transform_changed=lambda e: self.update_zoom_label(e.scale),
-                    content=ft.Image(src=image_src, fit=ft.BoxFit.CONTAIN, expand=True), expand=True)
-                self.preview.content = self.viewer
-            except (OSError, ValueError):
-                logging.exception("Could not render page preview")
-                self.preview.content = ft.Text("Preview unavailable for this page", color=INK, size=16)
-        else:
-            self.preview.content = ft.Column(horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                alignment=ft.MainAxisAlignment.CENTER, controls=[
-                    ft.Icon(ft.Icons.DOCUMENT_SCANNER, size=72, color=ACCENT),
-                    ft.Text("Ready to scan your first page", color=INK, size=22, weight=ft.FontWeight.BOLD),
-                    ft.Text("Choose your scanner and settings to begin.", color=MUTED, size=14),
-                    ft.Button("Start Scanning", icon=ft.Icons.DOCUMENT_SCANNER,
-                              style=ft.ButtonStyle(bgcolor=ACCENT, color="white"),
-                              on_click=lambda e: self.start_scan_primary())])
-        if self.active_view == "scan":
-            self.page.update()
-
-    def select_page(self, page_id):
-        if page_id in self.session.selected:
-            self.session.selected.remove(page_id)
-        else:
-            self.session.selected.add(page_id)
-        self.active_page_id = page_id
-        self.refresh_pages()
-
-    async def zoom(self, factor):
-        if self.viewer:
-            await self.viewer.zoom(factor)
-
-    def update_zoom_label(self, scale):
-        self.zoom_label.value = f"{scale * 100:.0f}%"
-        if self.active_view == "scan":
-            self.zoom_label.update()
-
-    async def fit(self):
-        if self.viewer:
-            await self.viewer.reset()
-
-    def reorder(self, e):
-        self.session.reorder(e.old_index, e.new_index)
-        self.refresh_pages()
-
-    def on_driver_change(self):
-        self.settings.set(driver=self.driver_select.value or "auto")
-        self.refresh_scanners()
-
-    def start_scan_primary(self):
-        if self.busy:
-            self.message("A scan is already running.", True)
-            return
-        if self.selected_scanner() is None:
-            self.message("Select a scanner first. If none are listed, click Refresh.", True)
-            return
-        asyncio.create_task(self.scan())
-
-    def cancel_scan(self):
-        if not self.busy or not self._active_backend:
-            self.message("No scan is running.")
-            return
-        self.message("Canceling the scan…")
-        try:
-            self._active_backend.cancel()
-        except Exception:
-            logging.exception("Could not cancel the scan")
-
-    def _set_scan_ui(self, busy, scanner=None):
-        if not hasattr(self, "scan_button"):
-            return
-        self.scan_button.disabled = busy
-        self.cancel_button.visible = busy
-        for control in (self.scanner_select, self.source, self.dpi,
-                        self.settings_button, self.refresh_button):
-            control.disabled = busy
-        for button in self.edit_buttons:
-            button.disabled = busy or not bool(self.session.selected)
-        self.page_menu.items[2].disabled = busy or not bool(self.session.selected)
-        if busy:
-            self.scan_button.text = "Generating pages…" if scanner and scanner.mock else "Scanning…"
-            self.scan_progress.visible = True
-        else:
-            self.scan_button.text = "Scan More Pages" if self.session.pages else "Start Scanning"
-            self.scan_progress.visible = False
-        self.page.update()
-
-    async def scan(self, e=None, at=None, replace=0, pair=False):
-        if self.busy:
+    def start_scan(self, replace=None):
+        if self.running:
             return
         scanner = self.selected_scanner()
         if scanner is None:
-            self.message("Select a scanner first.", True)
+            self.message("Select a scanner and try again.", True)
             return
-        options = ScanOptions(scanner=scanner, source="duplex" if pair else ("glass" if replace == 1 else self.source.value),
-            dpi=int(self.dpi.value), color=self.color.value, paper=self.paper.value,
-            deskew=bool(self.deskew.value), pages=2 if pair and scanner.mock else 1)
-        self.settings.set(source=self.source.value, dpi=options.dpi, color=options.color,
-                          paper=options.paper, deskew=options.deskew,
-                          driver=(self.driver_select.value or "auto") if hasattr(self, "driver_select") else self.settings.get("driver"),
-                          default_scanner=self.scanner_select.value)
-        self.busy = True
-        self._active_backend = self.mock if scanner.mock else self.naps2
-        self._set_scan_ui(True, scanner)
-        self.message("Scanning…" if not scanner.mock else "Generating mock pages…")
-        path = self.session.directory / f"job-{uuid.uuid4().hex}.pdf"
-        try:
+        self.settings.set(source=self.source.currentData(), dpi=self.dpi.currentData(),
+                          color=self.color.currentData(), paper=self.paper.currentData(),
+                          deskew=self.deskew.isChecked())
+        options = ScanOptions(scanner=scanner, source=self.source.currentData(), dpi=self.dpi.currentData(),
+                              color=self.color.currentData(), paper=self.paper.currentData(),
+                              deskew=self.deskew.isChecked())
+        backend = self.mock if scanner.mock else self.naps2
+        self.active_backend = backend
+        self.running = True
+        self.scan_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.show()
+        self.scan_status.setText("Scanning…")
+        def operation():
+            with staging_directory(self.session.directory) as directory:
+                path = Path(directory) / "scan.pdf"
+                backend.scan(options, path)
+                return self.session.import_pdf(path, at=replace, replace=1 if replace is not None else 0,
+                                               duplex=options.source == "duplex")
+        self.run_job(operation, self._scan_complete, self._scan_failed)
+
+    def cancel_scan(self):
+        if self.active_backend:
+            self.active_backend.cancel()
+            self.scan_status.setText("Canceling…")
+
+    def _scan_complete(self, pages):
+        self._end_scan()
+        self.refresh_pages()
+        self.message(f"Added {len(pages)} page(s).")
+
+    def _scan_failed(self, error):
+        self._end_scan()
+        self.message(error or "Scanning failed. Previously scanned pages were kept.", True)
+
+    def _end_scan(self):
+        self.running = False
+        self.active_backend = None
+        self.scan_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.hide()
+        self.scan_status.setText("Ready")
+
+    def import_pdf(self):
+        if self.running:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Add PDF pages", "", "PDF files (*.pdf)")
+        if path:
+            self.running = True
+            self.scan_status.setText("Importing PDF…")
+            self.run_job(lambda: self.session.import_pdf(Path(path)),
+                         lambda pages: (setattr(self, "running", False), self.scan_status.setText("Ready"),
+                                        self.refresh_pages(), self.message(f"Added {len(pages)} page(s).")),
+                         lambda error: (setattr(self, "running", False), self.scan_status.setText("Import failed"),
+                                        self.message(error, True)))
+
+    def refresh_pages(self):
+        self.preview_cache.clear()
+        self.thumbnails.blockSignals(True)
+        self.thumbnails.clear()
+        for number, page in enumerate(self.session.pages):
+            item = QListWidgetItem(str(number + 1))
             try:
-                await asyncio.to_thread(self._active_backend.scan, options, path)
-                failure = None
-            except ScannerError as exc:
-                if not path.is_file():
-                    raise
-                # NAPS2 hit a problem but wrote a partial output file; recover those pages.
-                failure = str(exc)
-            if replace:
-                with fitz.open(path) as scanned:
-                    if scanned.page_count != replace:
-                        raise ScannerError(f"Retake produced {scanned.page_count} page(s); expected {replace}. Original pages were kept.")
-            items = await asyncio.to_thread(self.session.import_pdf, path, at, replace,
-                                            options.source == "duplex")
+                item.setIcon(QIcon(str(self.session.preview_path(page, 100))))
+            except Exception:
+                logging.exception("Page thumbnail failed")
+            item.setData(Qt.ItemDataRole.UserRole, page.id)
+            item.setSizeHint(QSize(108, 152))
+            self.thumbnails.addItem(item)
+        count = len(self.session.pages)
+        size = sum((self.session.directory / p.original).stat().st_size for p in self.session.pages)
+        size_label = f"{size / (1024 * 1024):.1f} MB" if size >= 1024 * 1024 else f"{size / 1024:.0f} KB"
+        format_name = self.paper.currentText() if count and self.paper.currentData() != "auto" else ""
+        self.page_count.setText(f"{count} {'page' if count == 1 else 'pages'}" +
+                                (f" · {format_name} · {size_label}" if format_name else f" · {size_label}" if count else ""))
+        self.position_label.setText(f"{min(self.current_page + 1, count) if count else 0} of {count}")
+        self.document_name.setText("Untitled scan" if not self.session.source_document_id else
+                                   (self.library.get(self.session.source_document_id) or {"title": "Untitled scan"})["title"])
+        self.save_button.setEnabled(bool(count))
+        self.export_button.setEnabled(bool(count))
+        for control in self.page_actions:
+            control.setEnabled(bool(count))
+        self.scan_button.setText("Scan page")
+        self.thumbnails.blockSignals(False)
+        if self.session.pages:
+            row = min(self.current_page, len(self.session.pages) - 1)
+            self.thumbnails.setCurrentRow(row)
+            self.thumbnails.item(row).setSelected(True)
+            self.sync_selection()
+            self.show_page()
+        else:
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("Scan a page or import a PDF to begin")
+            self.preview.setStyleSheet("background:transparent; color:#647083")
+            self.preview.setFixedSize(270, 80)
+            self.preview.graphicsEffect().setEnabled(False)
+            self.zoom_label.setText("Fit")
+
+    def select_page(self, index):
+        if index < 0 or index >= len(self.session.pages):
+            return
+        self.current_page = index
+        self.show_page()
+
+    def sync_selection(self):
+        self.session.selected = {item.data(Qt.ItemDataRole.UserRole) for item in self.thumbnails.selectedItems()}
+
+    def show_page(self):
+        if not self.session.pages:
+            return
+        page = self.session.pages[self.current_page]
+        if page.id not in self.preview_cache:
+            self.preview_cache[page.id] = QPixmap(str(self.session.preview_path(page, 1200)))
+        pix = self.preview_cache[page.id]
+        original_width = pix.width()
+        available = self.paper_scroll.viewport().size() - QSize(42, 30)
+        if self.zoom_scale == 0:
+            pix = pix.scaled(available, Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        elif self.zoom_scale == -1:
+            pix = pix.scaledToWidth(max(200, available.width()), Qt.TransformationMode.SmoothTransformation)
+        else:
+            pix = pix.scaled(int(pix.width() * self.zoom_scale), int(pix.height() * self.zoom_scale),
+                             Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self.display_scale = pix.width() / original_width if original_width else 1
+        self.zoom_label.setText(f"{round(self.display_scale * 100)}%")
+        self.preview.setText("")
+        self.preview.setStyleSheet("background:white")
+        self.preview.graphicsEffect().setEnabled(True)
+        self.preview.setFixedSize(pix.size())
+        self.preview.setPixmap(pix)
+        self.position_label.setText(f"{self.current_page + 1} of {len(self.session.pages)}")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "preview") and self.session.pages and self.zoom_scale <= 0:
+            QTimer.singleShot(0, self.show_page)
+
+    def set_zoom(self, scale):
+        self.zoom_scale = scale
+        self.show_page()
+
+    def reorder_pages(self, parent, start, end, destination, row):
+        if self.running:
+            return
+        ordered_ids = [self.thumbnails.item(i).data(Qt.ItemDataRole.UserRole)
+                       for i in range(self.thumbnails.count())]
+        pages = {page.id: page for page in self.session.pages}
+        if len(ordered_ids) == len(pages) and set(ordered_ids) == set(pages):
+            self.session.checkpoint()
+            current_id = self.session.pages[self.current_page].id
+            self.session.pages = [pages[page_id] for page_id in ordered_ids]
+            self.session.persist()
+            self.current_page = ordered_ids.index(current_id)
             self.refresh_pages()
-            if failure is None:
-                self.message(f"Added {len(items)} page(s). Use Scan More Pages to add more, "
-                             "or Save Document when finished.")
-            else:
-                self.message(f"The scan ended with a problem, but {len(items)} page(s) were "
-                             f"recovered: {failure}", True)
-        except (ScannerError, OSError, ValueError, RuntimeError) as exc:
-            logging.exception("Scan failed")
-            if "cancel" in str(exc).lower():
-                self.message("Scan canceled. Previously scanned pages were kept.", True)
-            else:
-                self.message(f"Scan failed: {exc}", True)
-        finally:
-            path.unlink(missing_ok=True)
-            self.busy = False
-            self._active_backend = None
-            self._set_scan_ui(False)
 
-    def require_selection(self):
-        if not self.session.selected:
-            self.message("Select a page first.", True)
-            return False
-        return True
-
-    def edit_rotate(self, degrees):
-        if self.require_selection():
-            self.session.rotate(degrees)
+    def rotate_page(self):
+        if self.running:
+            return
+        if self.session.selected:
+            self.session.rotate(90)
             self.refresh_pages()
 
-    def edit_delete(self):
-        if self.require_selection():
+    def crop_page(self):
+        if self.running or not self.session.pages:
+            return
+        page = self.session.pages[self.current_page]
+        preview = QPixmap(str(self.session.preview_path(page, 1200)))
+        dialog = CropDialog(preview, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.bounds():
+            self.session.crop_visible_page(page, dialog.bounds())
+            self.refresh_pages()
+            self.message("Page cropped. Use Undo to restore the previous view.")
+
+    def delete_pages(self):
+        if self.running:
+            return
+        if self.session.selected and QMessageBox.question(self, "Delete pages", "Remove selected pages from this scan?") == QMessageBox.StandardButton.Yes:
             self.session.delete()
             self.refresh_pages()
 
-    def history(self, undo):
-        self.session.undo() if undo else self.session.redo()
+    def retake_page(self):
+        if self.running:
+            return
+        if self.current_page < len(self.session.pages):
+            self.start_scan(self.current_page)
+
+    def undo(self):
+        if self.running:
+            return
+        self.session.undo()
         self.refresh_pages()
 
-    def crop_dialog(self, e=None):
-        if not self.require_selection():
+    def redo(self):
+        if self.running:
             return
-        fields = [ft.TextField(label=name, value=value, width=90) for name, value in
-                  [("Left %", "0"), ("Top %", "0"), ("Right %", "100"), ("Bottom %", "100")]]
-        def apply(e):
-            try:
-                l, t, r, b = [float(f.value) / 100 for f in fields]
-                if not (0 <= l < r <= 1 and 0 <= t < b <= 1):
-                    raise ValueError()
-                self.session.crop((l, t, r, b))
-                self.close_dialog()
-                self.refresh_pages()
-            except ValueError:
-                self.message("Enter crop percentages from 0 to 100 with left < right and top < bottom.", True)
-        self.dialog("Crop selected pages", ft.Row(controls=fields),
-                    [ft.TextButton("Cancel", on_click=lambda e: self.close_dialog()),
-                     ft.Button("Apply", on_click=apply)])
-
-    def retake(self, pair):
-        if not self.require_selection():
-            return
-        index = next(i for i, p in enumerate(self.session.pages) if p.id in self.session.selected)
-        if pair:
-            sheet_id = self.session.pages[index].sheet_id
-            if not sheet_id:
-                self.message("This page has no recorded duplex partner. Retake one side instead.", True)
-                return
-            members = [i for i, p in enumerate(self.session.pages) if p.sheet_id == sheet_id]
-            if len(members) != 2 or members[1] != members[0] + 1:
-                self.message("The duplex pair is no longer adjacent. Rearrange it before retaking both sides.", True)
-                return
-            index = members[0]
-        self.open_scan_setup(at=index, replace=2 if pair else 1, pair=pair)
+        self.session.redo()
+        self.refresh_pages()
 
     def new_document(self):
-        if self.session.pages:
-            self.confirm("Discard unsaved pages?", "This will clear the current scan session.", self._reset)
-        else:
-            self._reset()
-
-    def _reset(self):
+        if self.running:
+            return
+        if self.session.pages and QMessageBox.question(self, "New document", "Discard the current unsaved pages?") != QMessageBox.StandardButton.Yes:
+            return
         self.session.reset()
+        self.pending_metadata = None
+        self.current_page = 0
         self.refresh_pages()
-        self._set_scan_ui(False)
-        self.message("New document ready.")
 
-    def save_dialog(self, e=None, save_as=False):
-        if not self.session.pages:
-            self.message("Scan or open a document first.", True)
+    def save_document(self):
+        if not self.session.pages or self.running:
+            self.message("Scan or import pages before saving.", True)
             return
-        existing = self.library.get(self.session.source_document_id) if self.session.source_document_id else None
-        name = ft.TextField(label="Document name", value=existing["title"] if existing else "Untitled scan", width=420)
-        category = ft.Dropdown(label="Category", width=200, value=str(existing["category_id"] if existing else 1),
-            options=[option(c["id"], c["name"]) for c in self.library.categories()])
-        description = ft.TextField(label="Description", value=existing["description"] if existing else "", multiline=True)
-        tags = ft.TextField(label="Tags (comma separated)", value=existing["tags"] if existing else "")
-        location = ft.RadioGroup(content=ft.Column(controls=[ft.Radio(value="library", label="Default Document Library"),
-                                                       ft.Radio(value="custom", label="Choose location…")]),
-                                 value="library" if save_as or not existing else "existing")
-        if existing and not save_as:
-            location.content.controls.insert(0, ft.Radio(value="existing", label="Save changes to this PDF"))
-        include = ft.Checkbox(label="Include in Document Library", value=True)
-        async def commit(e):
-            try:
-                clean = name.value.strip()
-                if not clean or re.search(r'[<>:"/\\|?*\x00-\x1f]', clean) or clean.rstrip(" .") != clean:
-                    raise ValueError("Enter a valid Windows document name.")
-                if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", clean, re.I):
-                    raise ValueError("That name is reserved by Windows.")
-                mode = location.value
-                if mode == "existing":
-                    dest = Path(existing["file_path"])
-                    if not dest.exists():
-                        raise ValueError("Original PDF is missing. Use Save As instead.")
-                elif mode == "custom":
-                    chosen = await ft.FilePicker().save_file(dialog_title="Save PDF", file_name=f"{clean}.pdf",
-                        initial_directory=self.settings.get("last_save_dir"),
-                        file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["pdf"])
-                    if not chosen:
-                        return
-                    dest = Path(chosen)
-                    if dest.suffix.lower() != ".pdf":
-                        dest = dest.with_suffix(".pdf")
-                else:
-                    root = Path(self.settings.get("library_dir")) / "documents"
-                    root.mkdir(parents=True, exist_ok=True)
-                    dest = root / (f"{uuid.uuid4().hex}-{clean}.pdf")
-                registered = self.library.by_path(dest)
-                if registered and (not existing or registered["id"] != existing["id"]):
-                    raise ValueError("This PDF is already managed by the library. Choose another name.")
-                if dest.exists() and mode != "existing":
-                    self.close_dialog()
-                    self.confirm("Replace existing file?", f"{dest.name} already exists. Replace it?",
-                                 lambda: asyncio.create_task(self._save_to(dest, clean, category.value,
-                                     description.value, tags.value, include.value, existing, mode)))
-                    return
-                self.close_dialog()
-                await self._save_to(dest, clean, category.value, description.value,
-                                    tags.value, include.value, existing, mode)
-            except (ValueError, OSError, sqlite3.Error) as exc:
-                logging.exception("Save setup failed")
-                self.message(str(exc), True)
-        self.dialog("Save Document", ft.Column(width=450, tight=True, controls=[name, category,
-            description, tags, location, include]),
-            [ft.TextButton("Cancel", on_click=lambda e: self.close_dialog()),
-             ft.Button("Save PDF", on_click=commit)])
-
-    async def _save_to(self, dest, clean, category_id, description, tags, include, existing, mode):
-        backup = None
-        existed = dest.exists()
-        try:
-            if existed:
-                handle, backup_name = tempfile.mkstemp(prefix="scanow-backup-", suffix=".pdf")
-                os.close(handle)
-                backup = Path(backup_name)
-                shutil.copy2(dest, backup)
-            await asyncio.to_thread(export_pdf, self.session, dest)
-            if mode == "existing" or include or mode == "library":
-                document_id = existing["id"] if mode == "existing" and existing else None
-                self.library.save(clean, dest, int(category_id), description, tags,
-                                  len(self.session.pages), document_id)
-            self.settings.set(last_save_dir=str(dest.parent))
-            self.session.reset()
-            self.refresh_pages()
-            self._set_scan_ui(False)
-            self.message(f"Saved {dest.name}")
-        except (OSError, ValueError, sqlite3.Error) as exc:
-            logging.exception("Save failed")
-            try:
-                if backup and backup.exists():
-                    shutil.copy2(backup, dest)
-                elif not existed:
-                    dest.unlink(missing_ok=True)
-            except OSError:
-                logging.exception("Could not restore PDF after failed save")
-            self.message(f"Could not save PDF: {exc}", True)
-        finally:
-            if backup:
-                backup.unlink(missing_ok=True)
-
-    def show_library(self):
-        search = ft.TextField(label="Search documents", prefix_icon=ft.Icons.SEARCH, width=280,
-                              on_change=lambda e: render())
-        category = ft.Dropdown(label="Category", width=180, value="all",
-            options=[option("all", "All categories")] + [option(c["id"], c["name"]) for c in self.library.categories()],
-            on_select=lambda e: render())
-        sort = ft.Dropdown(label="Sort", width=160, value="newest", options=[option(k, v) for k, v in
-            [("newest", "Newest"), ("oldest", "Oldest"), ("az", "Name A–Z"),
-             ("za", "Name Z–A"), ("size", "File size")]], on_select=lambda e: render())
-        availability = ft.Dropdown(label="Availability", width=160, value="all", options=[
-            option("all", "All files"), option("available", "Available"), option("missing", "File missing")],
-            on_select=lambda e: render())
-        rows = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=4)
-        def render():
-            rows.controls.clear()
-            records = self.library.documents(search.value or "", None if category.value == "all" else int(category.value), sort.value)
-            for record in records:
-                present = Path(record["file_path"]).is_file()
-                if availability.value == "available" and not present or availability.value == "missing" and present:
-                    continue
-                rows.controls.append(ft.Container(bgcolor=CONTENT,
-                    border=ft.Border.all(1, BORDER),
-                    border_radius=8, padding=12, content=ft.Row(spacing=10, controls=[
-                        ft.Icon(ft.Icons.PICTURE_AS_PDF, color=ACCENT),
-                        ft.Column(expand=True, spacing=2, controls=[
-                            ft.Text(record["title"], weight=ft.FontWeight.BOLD, color=INK),
-                            ft.Text(f"{record['category']}  •  {record['page_count']} pages  •  "
-                                    f"{record['file_size'] // 1024} KB  •  {record['updated_at'][:10]}", size=11, color=MUTED),
-                            ft.Text(record["file_path"], size=10, color=MUTED, overflow=ft.TextOverflow.ELLIPSIS)]),
-                        ft.Text("File missing" if not present else "", color="#B63B36", size=11),
-                        ft.TextButton("Preview" if present else "Locate", on_click=lambda e, r=record: self.preview_document(r) if Path(r["file_path"]).is_file() else self.locate(r)),
-                        ft.PopupMenuButton(items=[
-                            ft.PopupMenuItem(content=ft.Text("Open PDF"), on_click=lambda e, r=record: self.open_file(r)),
-                            ft.PopupMenuItem(content=ft.Text("Open folder"), on_click=lambda e, r=record: self.open_folder(r)),
-                            ft.PopupMenuItem(content=ft.Text("Edit metadata"), on_click=lambda e, r=record: self.edit_metadata(r)),
-                            ft.PopupMenuItem(content=ft.Text("Edit pages"), on_click=lambda e, r=record: self.open_workspace(r)),
-                            ft.PopupMenuItem(content=ft.Text("Export copy"), on_click=lambda e, r=record: asyncio.create_task(self.export_copy(r))),
-                            ft.PopupMenuItem(content=ft.Text("Delete record"), on_click=lambda e, r=record: self.delete_document(r)),
-                        ])])))
-            if not rows.controls:
-                rows.controls.append(ft.Container(content=ft.Text("No documents found.", color=MUTED), padding=30))
-            self.page.update()
-        self.switch("library", ft.Column(expand=True, spacing=16, controls=[
-            ft.Row(controls=[title("Document Library"), ft.Container(expand=True),
-                             ft.Button("Categories", on_click=lambda e: self.category_manager())]),
-            ft.Row(wrap=True, spacing=10, controls=[search, category, sort, availability]), rows]))
-        render()
-
-    def preview_document(self, record):
-        try:
-            with fitz.open(record["file_path"]) as doc:
-                images = [page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False).tobytes("png")
-                          for page in list(doc)[:20]]
-            content = ft.Column(width=650, height=560, scroll=ft.ScrollMode.AUTO, controls=[
-                ft.Image(src=data, width=580, fit=ft.BoxFit.CONTAIN) for data in images])
-            self.dialog(record["title"], content, [ft.TextButton("Close", on_click=lambda e: self.close_dialog())])
-        except (OSError, RuntimeError) as exc:
-            self.message(f"Could not preview PDF: {exc}", True)
-
-    def open_file(self, record):
-        try:
-            os.startfile(record["file_path"])
-        except OSError as exc:
-            self.message(f"Could not open PDF: {exc}", True)
-
-    def open_folder(self, record):
-        path = Path(record["file_path"])
-        if path.parent.exists():
-            os.startfile(path.parent)
-        else:
-            self.message("The containing folder is unavailable.", True)
-
-    async def export_copy(self, record):
-        path = Path(record["file_path"])
-        if not path.exists():
-            self.message("Locate the missing PDF first.", True)
+        record = self.library.get(self.session.source_document_id) if self.session.source_document_id else None
+        dialog = MetadataDialog(self.library, record, self, self.pending_metadata)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        dest = await ft.FilePicker().save_file(file_name=path.name, dialog_title="Export PDF copy",
-            file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["pdf"])
-        if dest:
-            target = Path(dest)
-            if target.resolve() == path.resolve():
-                self.message("Choose a different destination for the copy.", True)
-                return
-            shutil.copy2(path, target)
-            self.message(f"Exported copy to {target}")
+        values = dialog.values()
+        self.pending_metadata = values
+        self.running = True
+        self.scan_status.setText("Saving PDF…")
+        self.scan_button.setEnabled(False)
+        self.run_job(lambda: self.archive.save_session(self.session, values,
+                    self.session.source_document_id), self._saved, self._save_failed)
 
-    async def locate(self, record):
-        selected = await ft.FilePicker().pick_files(allow_multiple=False,
-            file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["pdf"])
-        if selected:
-            path = Path(selected[0].path)
-            try:
-                with fitz.open(path) as doc:
-                    if not doc.page_count:
-                        raise ValueError("The selected PDF has no pages.")
-                self.library.relink(record["id"], path)
-                self.show_library()
-            except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
-                self.message(f"Could not relink: {exc}", True)
+    def export_session(self):
+        if not self.session.pages or self.running:
+            self.message("Scan or import pages before exporting.", True)
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export current PDF", "ScaNow-document.pdf", "PDF files (*.pdf)")
+        if not path:
+            return
+        destination = Path(path)
+        if destination.exists() and QMessageBox.question(self, "Replace PDF", "Replace the selected PDF?") != QMessageBox.StandardButton.Yes:
+            return
+        self.running = True
+        self.scan_status.setText("Exporting PDF…")
+        def complete(result):
+            self.running = False
+            self.scan_status.setText("Ready")
+            self.message(f"Exported {result.name}.")
+        def failed(error):
+            self.running = False
+            self.scan_status.setText("Export failed")
+            self.message(error, True)
+        self.run_job(lambda: export_pdf(self.session, destination), complete, failed)
 
-    def edit_metadata(self, record):
-        name = ft.TextField(label="Document name", value=record["title"])
-        category = ft.Dropdown(label="Category", value=str(record["category_id"]),
-            options=[option(c["id"], c["name"]) for c in self.library.categories()])
-        description = ft.TextField(label="Description", value=record["description"])
-        tags = ft.TextField(label="Tags", value=record["tags"])
-        def save(e):
-            self.library.update_metadata(record["id"], name.value.strip(), int(category.value),
-                                         description.value, tags.value)
-            self.close_dialog()
-            self.show_library()
-        self.dialog("Edit document", ft.Column(tight=True, controls=[name, category, description, tags]),
-                    [ft.TextButton("Cancel", on_click=lambda e: self.close_dialog()), ft.Button("Save", on_click=save)])
+    def _saved(self, document_id):
+        self.pending_metadata = None
+        self.running = False
+        self.scan_button.setEnabled(True)
+        self.scan_status.setText("Ready")
+        self.refresh_pages()
+        self.refresh_library()
+        duplicate = self.library.duplicate_of(document_id)
+        suffix = f" Possible duplicate of #{duplicate['id']}." if duplicate else ""
+        self.message(f"Saved document #{document_id} to archive.{suffix}")
 
-    def delete_document(self, record):
-        def delete():
-            self.library.delete(record["id"])
-            self.show_library()
-            self.message("Library record removed. The PDF remains on disk.")
-        self.confirm("Remove from library?", f"Remove {record['title']} from the library? The PDF will remain on disk.", delete)
+    def _save_failed(self, error):
+        self.running = False
+        self.scan_button.setEnabled(True)
+        self.scan_status.setText("Save failed · pages kept")
+        self.message(f"Could not save document: {error}", True)
 
-    def open_workspace(self, record):
-        def load():
-            try:
-                self.session.reset()
-                self.session.import_pdf(Path(record["file_path"]))
-                self.session.source_document_id = record["id"]
-                self.session.persist()
-                self.show_scan()
-                self.message(f"Editing {record['title']}. Save Document updates this PDF; choose Save As for a copy.")
-            except (OSError, RuntimeError, ValueError) as exc:
-                self.message(f"Could not open PDF for editing: {exc}", True)
-        if self.session.pages:
-            self.confirm("Replace current session?", "The current unsaved pages will be discarded.", load)
-        else:
-            load()
-
-    def category_manager(self):
-        name = ft.TextField(label="Category name")
-        categories = ft.Dropdown(label="Existing category", options=[option(c["id"], c["name"])
-            for c in self.library.categories() if c["id"] != 1], width=260)
-        def add(e):
-            try:
-                self.library.add_category(name.value)
-                self.close_dialog()
-                self.show_library()
-            except sqlite3.IntegrityError:
-                self.message("That category already exists.", True)
-        def rename(e):
-            if categories.value:
-                try:
-                    self.library.rename_category(int(categories.value), name.value)
-                    self.close_dialog()
-                    self.show_library()
-                except sqlite3.IntegrityError:
-                    self.message("That category already exists.", True)
-        def remove(e):
-            if categories.value:
-                self.close_dialog()
-                self.confirm("Delete category?", "Its documents will move to Uncategorized.",
-                    lambda: (self.library.delete_category(int(categories.value)), self.show_library()))
-        self.dialog("Manage categories", ft.Column(tight=True, controls=[name, categories]), [
-            ft.TextButton("Close", on_click=lambda e: self.close_dialog()),
-            ft.TextButton("Delete", on_click=remove), ft.TextButton("Rename", on_click=rename),
-            ft.Button("Add", on_click=add)])
-
-    def show_settings(self):
-        path = ft.TextField(label="Document Library location", value=self.settings.get("library_dir"), expand=True)
-        naps2 = ft.TextField(label="NAPS2 Console path", value=self.settings.get("naps2_path"), expand=True)
-        async def pick_dir(e):
-            selected = await ft.FilePicker().get_directory_path()
-            if selected:
-                path.value = selected
-                self.page.update()
-        async def pick_naps2(e):
-            selected = await ft.FilePicker().pick_files(allow_multiple=False)
-            if selected:
-                naps2.value = selected[0].path
-                self.page.update()
-        def save(e):
-            new_root = Path(path.value).expanduser()
-            old_root = Path(self.settings.get("library_dir"))
-            try:
-                if new_root != old_root:
-                    new_root.mkdir(parents=True, exist_ok=True)
-                    old_managed = old_root / "documents"
-                    if old_managed.exists() and any(old_managed.iterdir()):
-                        self.confirm("Move managed PDFs?", "Managed files will move to the new folder. External files will stay where they are.",
-                            lambda: self._migrate(old_root, new_root, naps2.value))
-                        return
-                self.settings.set(library_dir=str(new_root), naps2_path=naps2.value)
-                self.naps2 = Naps2Backend(naps2.value)
-                self.refresh_scanners()
-                self.message("Settings saved.")
-            except OSError as exc:
-                self.message(f"Could not change location: {exc}", True)
-        content = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=18, controls=[
-            title("Settings"),
-            ft.Container(bgcolor=CONTENT, border=ft.Border.all(1, BORDER),
-                         padding=16, border_radius=8, content=ft.Column(controls=[
-                title("Document storage", 17), ft.Row(controls=[path, ft.Button("Browse", on_click=pick_dir)]),
-                ft.Text("Managed PDFs live here. Database and recovery files live in local AppData.", size=12, color=MUTED)])),
-            ft.Container(bgcolor=CONTENT, border=ft.Border.all(1, BORDER),
-                         padding=16, border_radius=8, content=ft.Column(controls=[
-                title("Scanner integration", 17), ft.Row(controls=[naps2, ft.Button("Browse", on_click=pick_naps2)]),
-                ft.Text("NAPS2 scanning engine ready" if self.naps2.available else
-                        "NAPS2 scanning engine missing. Reinstall ScaNow or browse to an external NAPS2.Console.exe. The mock scanner remains available.",
-                        color=MUTED)])),
-            ft.Row(controls=[ft.Button("Save settings", on_click=save),
-                ft.Button("Back up library", on_click=self.backup),
-                ft.Button("Restore library", on_click=self.restore)]),
-            ft.Text("ScaNow 0.1  •  Fully offline", color=MUTED)])
-        self.switch("settings", content)
-
-    def _migrate(self, old_root, new_root, naps2_path):
-        source = old_root / "documents"
-        target = new_root / "documents"
-        target.mkdir(parents=True, exist_ok=True)
+    def refresh_library(self):
+        if not hasattr(self, "model"):
+            return
         try:
-            for file in source.glob("*.pdf"):
-                shutil.copy2(file, target / file.name)
-            with self.library.connect() as con:
-                for record in con.execute("SELECT id,file_path FROM documents").fetchall():
-                    original = Path(record["file_path"])
-                    if original.parent.resolve() == source.resolve():
-                        con.execute("UPDATE documents SET file_path=? WHERE id=?",
-                                    (str(target / original.name), record["id"]))
-            self.settings.set(library_dir=str(new_root), naps2_path=naps2_path)
-            self.naps2 = Naps2Backend(naps2_path)
-            self.refresh_scanners()
-            self.message("Managed PDFs copied to the new library location.")
-        except (OSError, sqlite3.Error) as exc:
-            self.message(f"Migration failed: {exc}", True)
+            records = self.library.documents(self.search.text().strip(),
+                self.category_filter.currentData(), self.sort_filter.currentData(),
+                self.date_from.text().strip(), self.date_to.text().strip(), self.date_field.currentData())
+            self.model.set_records(records)
+            self.result_count.setText(f"{len(records)} document(s)")
+            for control in self.library_actions:
+                control.setEnabled(False)
+            self.preview_request += 1
+            self.clear_pdf()
+            self.selected_title.setText("Select a document" if records else "No documents found")
+            self.details.setText("Choose a row to preview its PDF and details." if records else
+                                 "Try another search or clear the filters." if self.search.text() or self.category_filter.currentData() else
+                                 "Scan a document and save it to the archive to begin.")
+        except Exception as exc:
+            logging.exception("Archive search failed")
+            self.message(f"Could not search archive: {exc}", True)
 
-    async def backup(self, e):
-        destination = await ft.FilePicker().save_file(file_name="ScaNow-backup.zip")
+    def selected_record(self):
+        row = self.table.currentIndex().row()
+        return self.model.records[row] if 0 <= row < len(self.model.records) else None
+
+    def preview_selected(self):
+        self.preview_request += 1
+        request = self.preview_request
+        record = self.selected_record()
+        for control in self.library_actions:
+            control.setEnabled(record is not None)
+        self.clear_pdf()
+        self.pdf_page_label.setText("0 / 0")
+        if not record:
+            self.selected_title.setText("Select a document")
+            self.details.setText("Choose a row to preview its PDF and details.")
+            return
+        path = Path(record["file_path"])
+        self.selected_title.setText(record["title"])
+        raw_date = record["document_date"] or record["created_at"][:10]
+        try:
+            readable_date = date.fromisoformat(raw_date).strftime("%b %d, %Y")
+        except ValueError:
+            readable_date = raw_date
+        self.details.setText(f"{record['category']} · {record['reference_number'] or 'No reference'} · {readable_date}\n"
+                             f"Related: {record['related_entity'] or '—'} · {record['page_count']} page(s)")
+        if path.is_file():
+            self.details.setText(self.details.text() + "\nLoading preview…")
+            self.run_job(path.read_bytes,
+                         lambda data: self.load_pdf_preview(request, record["id"], data),
+                         lambda error: self.preview_error(request, error))
+        else:
+            self.details.setText(self.details.text() + "\nPDF missing. Use Locate in the document menu.")
+
+    def load_pdf_preview(self, request, document_id, data):
+        selected = self.selected_record()
+        if request != self.preview_request or not selected or selected["id"] != document_id:
+            return
+        self.pdf_buffer = QBuffer(self)
+        self.pdf_buffer.setData(data)
+        self.pdf_buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        self.pdf.load(self.pdf_buffer)
+        if self.pdf.pageCount() == 0:
+            self.pdf_page_label.setText("0 / 0")
+            self.details.setText(self.details.text().replace("Loading preview…", "Preview unavailable or invalid PDF."))
+            return
+        self.pdf_page_label.setText(f"1 / {self.pdf.pageCount()}")
+        self.details.setText(self.details.text().replace("\nLoading preview…", ""))
+        QTimer.singleShot(50, self.pdf_fit)
+
+    def preview_error(self, request, error):
+        if request == self.preview_request:
+            self.details.setText(self.details.text().replace("Loading preview…", f"Preview unavailable: {error}"))
+
+    def clear_pdf(self):
+        self.pdf.close()
+        if self.pdf_buffer:
+            self.pdf_buffer.close()
+            self.pdf_buffer.deleteLater()
+            self.pdf_buffer = None
+
+    def pdf_fit(self):
+        if self.pdf.pageCount():
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitInView)
+
+    def change_pdf_page(self, offset):
+        count = self.pdf.pageCount()
+        if not count:
+            return
+        navigator = self.pdf_view.pageNavigator()
+        page = max(0, min(count - 1, navigator.currentPage() + offset))
+        navigator.jump(page, QPointF(0, 0), navigator.currentZoom())
+        self.pdf_page_label.setText(f"{page + 1} / {count}")
+
+    def pdf_zoom(self, factor):
+        if self.pdf.pageCount():
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
+            self.pdf_view.setZoomFactor(max(.25, min(4, self.pdf_view.zoomFactor() * factor)))
+
+    def open_selected(self):
+        record = self.selected_record()
+        if record and Path(record["file_path"]).is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(record["file_path"]))
+        elif record:
+            self.message("The PDF is missing. Use Locate in the document menu to reconnect it.", True)
+
+    def library_menu_at_button(self):
+        sender = self.sender()
+        point = sender.mapToGlobal(sender.rect().bottomLeft()) if sender else self.table.mapToGlobal(self.table.rect().center())
+        self.library_menu(self.table.viewport().mapFromGlobal(point))
+
+    def library_menu(self, position):
+        if not self.selected_record():
+            return
+        menu = QMenu(self)
+        for label, slot in (("Open PDF", self.open_selected), ("Open containing folder", self.open_folder),
+                            ("Export a copy", self.export_copy), ("Open in workspace", self.open_workspace),
+                            ("Edit metadata", self.edit_selected), ("Locate missing PDF", self.locate_file),
+                            ("Remove from archive index", self.remove_index),
+                            ("Delete managed PDF", self.delete_managed)):
+            menu.addAction(label, slot)
+        menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def open_folder(self):
+        record = self.selected_record()
+        if record:
+            folder = Path(record["file_path"]).parent
+            if folder.is_dir():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def export_copy(self):
+        record = self.selected_record()
+        if not record or not Path(record["file_path"]).is_file():
+            return
+        destination, _ = QFileDialog.getSaveFileName(self, "Export PDF copy", f"{record['title']}.pdf", "PDF files (*.pdf)")
         if destination:
+            target = Path(destination)
+            if target.exists() and QMessageBox.question(self, "Replace copy", "Replace the selected export file?") != QMessageBox.StandardButton.Yes:
+                return
             try:
-                with tempfile.TemporaryDirectory() as folder:
-                    snapshot = Path(folder) / "library.db"
-                    with self.library.connect() as source, sqlite3.connect(snapshot) as target:
-                        source.backup(target)
-                    with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
-                        archive.write(snapshot, "library.db")
-                        root = Path(self.settings.get("library_dir")) / "documents"
-                        archive.writestr("manifest.json", json.dumps({"managed_dir": str(root)}))
-                        if root.exists():
-                            for file in root.glob("*.pdf"):
-                                archive.write(file, f"documents/{file.name}")
-                self.message(f"Backup saved to {destination}")
-            except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
-                logging.exception("Backup failed")
-                self.message(f"Backup failed: {exc}", True)
+                shutil.copy2(record["file_path"], target)
+                self.message(f"Exported {target.name}.")
+            except OSError as exc:
+                self.message(str(exc), True)
 
-    async def restore(self, e):
-        selected = await ft.FilePicker().pick_files(allow_multiple=False,
-            file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["zip"])
-        if not selected:
+    def open_workspace(self):
+        if self.running:
             return
-        archive_path = Path(selected[0].path)
-        self.confirm("Restore library?", "This replaces the current library metadata and managed PDFs. Back up the current library first.",
-            lambda: self._restore_archive(archive_path))
+        record = self.selected_record()
+        if not record or not Path(record["file_path"]).is_file():
+            return
+        if self.session.pages and QMessageBox.question(self, "Open in workspace", "Discard the current unsaved pages?") != QMessageBox.StandardButton.Yes:
+            return
+        self.clear_pdf()
+        self.session.reset()
+        self.running = True
+        self.run_job(lambda: self.session.import_pdf(Path(record["file_path"])),
+                     lambda pages: self._opened_workspace(record["id"]),
+                     lambda error: (setattr(self, "running", False), self.message(error, True)))
 
-    def _restore_archive(self, archive_path):
+    def _opened_workspace(self, document_id):
+        self.running = False
+        self.pending_metadata = None
+        self.session.source_document_id = document_id
+        self.session.persist()
+        self.current_page = 0
+        self.refresh_pages()
+        self.show_view(0)
+        self.message("PDF opened for page editing. Saving will replace its archive copy.")
+
+    def edit_selected(self):
+        record = self.selected_record()
+        if not record:
+            return
+        dialog = MetadataDialog(self.library, record, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            values = dialog.values()
+            try:
+                self.library.update_metadata(record["id"], values["title"], values["category_id"],
+                    values["description"], values["tags"], values["reference_number"],
+                    values["related_entity"], values["document_date"])
+                self.refresh_library()
+                self.message("Document details updated.")
+            except Exception as exc:
+                self.message(str(exc), True)
+
+    def locate_file(self):
+        record = self.selected_record()
+        if not record:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Locate PDF", "", "PDF files (*.pdf)")
+        if path:
+            try:
+                if self.library.by_path(path):
+                    raise ValueError("That PDF is already in the archive.")
+                self.library.relink(record["id"], Path(path))
+                self.refresh_library()
+            except Exception as exc:
+                self.message(str(exc), True)
+
+    def remove_index(self):
+        record = self.selected_record()
+        if record and QMessageBox.question(self, "Remove from archive", "Remove this record from the archive index? The PDF will stay on disk.") == QMessageBox.StandardButton.Yes:
+            self.library.delete(record["id"])
+            self.refresh_library()
+            self.message("Record removed. PDF kept on disk.")
+
+    def delete_managed(self):
+        record = self.selected_record()
+        if not record:
+            return
+        path = Path(record["file_path"])
+        if path.parent.resolve() != self.archive.documents_dir.resolve():
+            self.message("Only PDFs in the managed archive can be deleted here. Remove this index record instead.", True)
+            return
+        if QMessageBox.question(self, "Delete managed PDF", "Move this PDF to the archive's recovery folder and remove its index record?") != QMessageBox.StandardButton.Yes:
+            return
+        recovery = self.archive.documents_dir / "recovery"
+        recovery.mkdir(exist_ok=True)
+        target = recovery / f"{record['id']}-{path.name}"
+        if target.exists():
+            self.message("A recovery copy already exists; deletion was canceled.", True)
+            return
         try:
-            target_root = Path(self.settings.get("library_dir")) / "documents"
-            target_root.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory() as folder, zipfile.ZipFile(archive_path) as archive:
-                if not {"library.db", "manifest.json"}.issubset(archive.namelist()):
-                    raise ValueError("This is not a ScaNow backup.")
-                original_root = Path(json.loads(archive.read("manifest.json"))["managed_dir"])
-                snapshot = Path(folder) / "library.db"
-                snapshot.write_bytes(archive.read("library.db"))
-                with sqlite3.connect(snapshot) as con:
-                    valid = con.execute("PRAGMA integrity_check").fetchone()[0]
-                    if valid != "ok":
-                        raise ValueError("The backup database is damaged.")
-                    rows = con.execute("SELECT id,file_path FROM documents").fetchall()
-                    for document_id, file_path in rows:
-                        original = Path(file_path)
-                        if original.parent == original_root:
-                            con.execute("UPDATE documents SET file_path=? WHERE id=?",
-                                        (str(target_root / original.name), document_id))
-                    con.commit()
-                for name in archive.namelist():
-                    if name.startswith("documents/") and name.endswith(".pdf") and len(Path(name).parts) == 2:
-                        destination = target_root / Path(name).name
-                        temporary = target_root / f".{uuid.uuid4().hex}.tmp"
-                        temporary.write_bytes(archive.read(name))
-                        temporary.replace(destination)
-                snapshot.replace(self.library.path)
-            self.show_library()
-            self.message("Library restored.")
-        except (OSError, ValueError, KeyError, sqlite3.Error, zipfile.BadZipFile) as exc:
-            logging.exception("Restore failed")
-            self.message(f"Restore failed: {exc}", True)
+            if path.exists():
+                shutil.move(str(path), str(target))
+            self.library.delete(record["id"])
+            self.refresh_library()
+            self.message("PDF moved to recovery folder and removed from index.")
+        except Exception as exc:
+            if target.exists():
+                shutil.move(str(target), str(path))
+            self.message(str(exc), True)
 
+    def save_settings(self):
+        if self.running:
+            return
+        if not self.library_path.text().strip():
+            self.message("Choose an archive folder.", True)
+            return
+        new_root = Path(self.library_path.text().strip())
+        old_root = Path(self.settings.get("library_dir"))
+        if new_root != old_root and self.library.documents() and QMessageBox.question(self, "Move archive", "Copy managed PDFs to the new archive folder and update their paths?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if new_root != old_root:
+                source = old_root / "documents"
+                target = new_root / "documents"
+                target.mkdir(parents=True, exist_ok=True)
+                with closing(self.library.connect()) as con, con:
+                    records = con.execute("SELECT id,file_path FROM documents").fetchall()
+                    for record in records:
+                        original = Path(record["file_path"])
+                        if original.parent == source:
+                            destination = target / original.name
+                            if destination.exists():
+                                raise FileExistsError(f"Archive migration would overwrite {destination.name}.")
+                            shutil.copy2(original, destination)
+                            con.execute("UPDATE documents SET file_path=? WHERE id=?", (str(destination), record["id"]))
+            self.settings.set(library_dir=str(new_root), naps2_path=self.naps2_path.text().strip(),
+                              driver=self.driver.currentData(), theme=self.theme.currentData())
+            self.naps2 = Naps2Backend(self.settings.get("naps2_path"))
+            self.setStyleSheet(stylesheet(self.settings.get("theme")))
+            self._apply_pdf_background()
+            self.refresh_scanners()
+            self.message("Settings saved.")
+        except Exception as exc:
+            self.message(str(exc), True)
+
+    def manage_categories(self):
+        names = [r["name"] for r in self.library.categories()]
+        action, chosen = QInputDialog.getItem(self, "Categories", "Action:", ["Add", "Rename", "Delete"], 0, False)
+        if not chosen:
+            return
+        if action == "Add":
+            new, accepted = QInputDialog.getText(self, "Add category", "New category name:")
+            if accepted and new.strip():
+                try:
+                    self.library.add_category(new.strip())
+                except Exception as exc:
+                    self.message(str(exc), True)
+        else:
+            choice, ok = QInputDialog.getItem(self, "Categories", "Category:", names, 0, False)
+            if not ok:
+                return
+            record = next(r for r in self.library.categories() if r["name"] == choice)
+            if action == "Delete":
+                if QMessageBox.question(self, "Delete category", "Move its documents to Uncategorized and delete this category?") == QMessageBox.StandardButton.Yes:
+                    try:
+                        self.library.delete_category(record["id"])
+                    except Exception as exc:
+                        self.message(str(exc), True)
+            else:
+                new, accepted = QInputDialog.getText(self, "Rename category", "New name:", text=choice)
+                if accepted and new.strip():
+                    try:
+                        self.library.rename_category(record["id"], new.strip())
+                    except Exception as exc:
+                        self.message(str(exc), True)
+        self.category_filter.clear()
+        self.category_filter.addItem("All categories", None)
+        for record in self.library.categories():
+            self.category_filter.addItem(record["name"], record["id"])
+
+    def check_database(self):
+        self.message(f"Database integrity: {self.library.integrity_check()}")
+
+    def create_backup(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Create backup", "ScaNow-backup.zip", "ZIP files (*.zip)")
+        if path:
+            self.running = True
+            self.run_job(lambda: self.archive.backup(path),
+                         lambda result: (setattr(self, "running", False), self.message(f"Backup saved to {result}.")),
+                         lambda error: (setattr(self, "running", False), self.message(error, True)))
+
+    def restore_backup(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Restore backup", "", "ZIP files (*.zip)")
+        if not path:
+            return
+        if QMessageBox.question(self, "Restore backup", "Restore this backup? Current metadata and managed PDFs will be moved to recovery copies first.") != QMessageBox.StandardButton.Yes:
+            return
+        self.running = True
+        self.run_job(lambda: self.archive.restore(path),
+                     lambda recovery: (setattr(self, "running", False), self.refresh_library(),
+                                       self.message(f"Backup restored. Previous PDFs: {recovery}")),
+                     lambda error: (setattr(self, "running", False), self.message(error, True)))
+
+    def closeEvent(self, event):
+        if self.running:
+            self.message("Wait for scanning to finish or cancel it before closing.")
+            event.ignore()
+        else:
+            event.accept()
+
+    # Reference layout: compact top controls, page strip, paper canvas, action panel.
+    def _build_scan(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        top = QFrame()
+        top.setObjectName("topbar")
+        bar = QHBoxLayout(top)
+        bar.setContentsMargins(14, 5, 14, 5)
+        bar.setSpacing(7)
+        self.scanner_status_dot = QLabel("●")
+        self.scanner_status_dot.setStyleSheet("color:#9AA4B3; font-size:11pt")
+        bar.addWidget(self.scanner_status_dot)
+        self.scanner_select = QComboBox()
+        self.scanner_select.setMinimumWidth(230)
+        self.scanner_select.setMaximumWidth(300)
+        self.scanner_select.addItem("Finding scanners…", None)
+        self.scanner_select.currentIndexChanged.connect(self.remember_scanner)
+        bar.addWidget(self.scanner_select)
+        self.dpi = combo([(f"{n} dpi", n) for n in (150, 200, 300, 600)], self.settings.get("dpi"))
+        self.color = combo([("Color", "color"), ("Gray", "gray"), ("B&W", "bw")], self.settings.get("color"))
+        self.paper = combo([("Auto", "auto")] + [(n.upper(), n) for n in ("a4", "letter", "legal")],
+                           self.settings.get("paper"))
+        self.source = combo([("Flatbed", "glass"), ("ADF", "feeder"), ("Duplex", "duplex")], self.settings.get("source"))
+        for control, tip in ((self.dpi, "Resolution"), (self.color, "Color mode"),
+                             (self.paper, "Paper size"), (self.source, "Scan source")):
+            control.setToolTip(tip)
+            bar.addWidget(control)
+        self.deskew = QCheckBox("Deskew")
+        self.deskew.setChecked(self.settings.get("deskew"))
+        self.scan_options = icon_button("more", self.scan_options_menu, "More scan and page options")
+        bar.addWidget(self.scan_options)
+        bar.addStretch()
+        bar.addWidget(action("Import PDF", self.import_pdf))
+        self.scan_button = action("Scan page", self.start_scan, primary=True, tip="Scan page (Ctrl+Shift+S)")
+        bar.addWidget(self.scan_button)
+        self.cancel_button = action("Cancel", self.cancel_scan)
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.hide()
+        bar.addWidget(self.cancel_button)
+        outer.addWidget(top)
+        outer.addSpacing(10)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setHandleWidth(1)
+        strip = QFrame()
+        strip.setObjectName("thumbnailPanel")
+        strip.setMinimumWidth(132)
+        strip.setMaximumWidth(166)
+        strip_layout = QVBoxLayout(strip)
+        strip_layout.setContentsMargins(6, 8, 6, 10)
+        strip_layout.setSpacing(6)
+        self.thumbnails = SmoothPageList()
+        self.thumbnails.setObjectName("thumbnails")
+        self.thumbnails.setViewMode(QListWidget.ViewMode.ListMode)
+        self.thumbnails.setFlow(QListWidget.Flow.TopToBottom)
+        self.thumbnails.setWrapping(False)
+        self.thumbnails.setIconSize(QSize(86, 116))
+        self.thumbnails.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.thumbnails.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.thumbnails.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.thumbnails.setDragEnabled(True)
+        self.thumbnails.setAcceptDrops(True)
+        self.thumbnails.setDropIndicatorShown(True)
+        self.thumbnails.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.thumbnails.currentRowChanged.connect(self.select_page)
+        self.thumbnails.itemSelectionChanged.connect(self.sync_selection)
+        self.thumbnails.model().rowsMoved.connect(self.reorder_pages)
+        self.thumbnails.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.thumbnails.customContextMenuRequested.connect(self.page_context_menu)
+        strip_layout.addWidget(self.thumbnails, 1)
+        strip_layout.addWidget(action("+ Add pages", self.import_pdf, kind="quiet"))
+        split.addWidget(strip)
+
+        canvas = QFrame()
+        canvas.setObjectName("documentCanvas")
+        canvas_layout = QVBoxLayout(canvas)
+        canvas_layout.setContentsMargins(10, 10, 10, 12)
+        canvas_layout.setSpacing(8)
+        self.paper_scroll = SmoothPaperScroll()
+        self.paper_scroll.setWidgetResizable(True)
+        self.paper_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.paper_scroll.setObjectName("paperScroll")
+        self.paper_surface = QFrame()
+        self.paper_surface.setObjectName("documentCanvas")
+        paper_layout = QVBoxLayout(self.paper_surface)
+        paper_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        paper_layout.setContentsMargins(14, 14, 14, 8)
+        self.preview = QLabel("Scan a page or import a PDF to begin")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setObjectName("paper")
+        self.preview.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        shadow = QGraphicsDropShadowEffect(self.preview)
+        shadow.setBlurRadius(16)
+        shadow.setOffset(0, 3)
+        shadow.setColor(QColor(44, 55, 76, 42))
+        self.preview.setGraphicsEffect(shadow)
+        paper_layout.addWidget(self.preview, 0, Qt.AlignmentFlag.AlignCenter)
+        self.paper_scroll.setWidget(self.paper_surface)
+        floating = QFrame()
+        floating.setObjectName("floatingTools")
+        editing = QHBoxLayout(floating)
+        editing.setContentsMargins(6, 2, 7, 2)
+        editing.setSpacing(2)
+        editing.addWidget(heading("Rotate", True))
+        self.page_actions = [icon_button("rotate_left", lambda: self.rotate_page_by(-90), "Rotate left"),
+                             icon_button("rotate_right", lambda: self.rotate_page_by(90), "Rotate right"),
+                             action("Crop", self.crop_page, kind="quiet"),
+                             action("Delete page", self.delete_pages, kind="danger")]
+        self.page_actions[-1].setMinimumWidth(94)
+        for control in self.page_actions:
+            editing.addWidget(control)
+        editing.addWidget(line())
+        editing.addWidget(icon_button("left", lambda: self.change_page(-1), "Previous page"))
+        self.position_label = heading("0 of 0", True)
+        editing.addWidget(self.position_label)
+        editing.addWidget(icon_button("right", lambda: self.change_page(1), "Next page"))
+        editing.addWidget(line())
+        editing.addWidget(action("−", lambda: self.zoom_step(.8), kind="quiet", tip="Zoom out"))
+        self.zoom_label = heading("Fit", True)
+        editing.addWidget(self.zoom_label)
+        editing.addWidget(action("+", lambda: self.zoom_step(1.25), kind="quiet", tip="Zoom in"))
+        fit = action("Fit", self.zoom_menu, kind="quiet", tip="Fit page or width")
+        editing.addWidget(fit)
+        float_row = QHBoxLayout()
+        float_row.addStretch()
+        float_row.addWidget(floating)
+        float_row.addStretch()
+        canvas_layout.addWidget(self.paper_scroll, 1)
+        canvas_layout.addLayout(float_row)
+        split.addWidget(canvas)
+
+        panel = QFrame()
+        panel.setObjectName("actionPanel")
+        panel.setMinimumWidth(188)
+        panel.setMaximumWidth(310)
+        info = QVBoxLayout(panel)
+        info.setContentsMargins(16, 16, 16, 12)
+        info.setSpacing(7)
+        self.document_name = heading("Untitled scan")
+        info.addWidget(self.document_name)
+        self.page_count = heading("0 pages", True)
+        info.addWidget(self.page_count)
+        info.addSpacing(12)
+        self.save_button = action("Save to Archive", self.save_document, primary=True)
+        info.addWidget(self.save_button)
+        note = heading("Stores it in your library with searchable details.", True)
+        note.setWordWrap(True)
+        info.addWidget(note)
+        info.addSpacing(3)
+        self.export_button = action("Export PDF…", self.export_session)
+        info.addWidget(self.export_button)
+        note = heading("Saves a copy anywhere you choose. Not added to the library.", True)
+        note.setWordWrap(True)
+        info.addWidget(note)
+        info.addStretch()
+        split.addWidget(panel)
+        split.setSizes([132, 820, 260])
+        outer.addWidget(split, 1)
+        outer.addSpacing(12)
+        self.scan_status = heading("Ready", True)
+        self.zoom_scale = 0
+        self.zoom_mode = "page"
+        self.stack.addWidget(page)
+
+    def scan_options_menu(self):
+        menu = QMenu(self)
+        for label, slot in (("Refresh scanners", self.refresh_scanners), ("New document", self.new_document),
+                            ("Undo", self.undo), ("Redo", self.redo), ("Retake selected page", self.retake_page)):
+            menu.addAction(label, slot)
+        menu.addSeparator()
+        menu.addAction("Deskew scans", lambda: self.deskew.setChecked(not self.deskew.isChecked())).setCheckable(True)
+        menu.actions()[-1].setChecked(self.deskew.isChecked())
+        menu.exec(self.scan_options.mapToGlobal(self.scan_options.rect().bottomLeft()))
+
+    def rotate_page_by(self, degrees):
+        if not self.running and self.session.selected:
+            self.session.rotate(degrees)
+            self.refresh_pages()
+
+    def rotate_menu(self):
+        menu = QMenu(self)
+        menu.addAction("Rotate left", lambda: self.rotate_page_by(-90))
+        menu.addAction("Rotate right", lambda: self.rotate_page_by(90))
+        sender = self.sender()
+        menu.exec(sender.mapToGlobal(sender.rect().bottomLeft()))
+
+    def page_context_menu(self, position):
+        item = self.thumbnails.itemAt(position)
+        if item is None:
+            return
+        self.thumbnails.setCurrentItem(item)
+        item.setSelected(True)
+        self.sync_selection()
+        menu = QMenu(self)
+        menu.addAction("Rotate left", lambda: self.rotate_page_by(-90))
+        menu.addAction("Rotate right", lambda: self.rotate_page_by(90))
+        menu.addAction("Crop page", self.crop_page)
+        menu.addAction("Delete page", self.delete_pages)
+        menu.exec(self.thumbnails.viewport().mapToGlobal(position))
+
+    def change_page(self, offset):
+        if self.session.pages:
+            self.thumbnails.setCurrentRow(max(0, min(len(self.session.pages) - 1, self.current_page + offset)))
+
+    def zoom_step(self, factor):
+        self.set_zoom(max(.25, min(3, getattr(self, "display_scale", 1) * factor)))
+
+    def zoom_menu(self):
+        menu = QMenu(self)
+        menu.addAction("Fit page", lambda: self.set_zoom(0))
+        menu.addAction("Fit width", lambda: self.set_zoom(-1))
+        menu.addAction("100%", lambda: self.set_zoom(1))
+        menu.exec(self.sender().mapToGlobal(self.sender().rect().bottomLeft()))
+
+    # Reference layout: one search bar, dense table, persistent document preview.
+    def _build_library(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        top = QFrame()
+        top.setObjectName("topbar")
+        filters = QHBoxLayout(top)
+        filters.setContentsMargins(14, 6, 14, 6)
+        filters.setSpacing(7)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search name, reference, company…    Ctrl+F")
+        self.search.setMinimumWidth(210)
+        self.search.setMaximumWidth(450)
+        filters.addWidget(self.search, 1)
+        self.category_filter = combo([("Category: All", None)] +
+                                     [(r["name"], r["id"]) for r in self.library.categories()])
+        filters.addWidget(self.category_filter)
+        self.date_filter = combo([("Date: All", "all"), ("This year", "year"), ("This month", "month"),
+                                  ("Custom…", "custom")])
+        self.date_filter.currentIndexChanged.connect(self.apply_date_filter)
+        filters.addWidget(self.date_filter)
+        more = icon_button("more", self.advanced_filters, "Sort and advanced filters")
+        filters.addWidget(more)
+        self.sort_filter = combo([("Newest", "newest"), ("Oldest", "oldest"),
+                                  ("Name A–Z", "az"), ("Name Z–A", "za"),
+                                  ("Category A–Z", "category_az"), ("Category Z–A", "category_za"),
+                                  ("Reference A–Z", "reference_az"), ("Reference Z–A", "reference_za"),
+                                  ("Largest", "size")])
+        self.date_from = QLineEdit()
+        self.date_to = QLineEdit()
+        self.date_field = combo([("Document date", "document"), ("Archived date", "archived")])
+        filters.addStretch()
+        self.result_count = heading("0 documents", True)
+        filters.addWidget(self.result_count)
+        outer.addWidget(top)
+        self.search_delay = QTimer(self)
+        self.search_delay.setSingleShot(True)
+        self.search_delay.setInterval(250)
+        self.search_delay.timeout.connect(self.refresh_library)
+        for field in (self.search, self.date_from, self.date_to):
+            field.textChanged.connect(lambda: self.search_delay.start())
+        self.date_field.currentIndexChanged.connect(self.refresh_library)
+        self.category_filter.currentIndexChanged.connect(self.refresh_library)
+        self.sort_filter.currentIndexChanged.connect(self.refresh_library)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setHandleWidth(1)
+        self.model = DocumentModel()
+        self.table = QTableView()
+        self.table.setModel(self.model)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(False)
+        self.table.setSortingEnabled(False)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.table.setColumnWidth(0, 140)
+        self.table.setColumnWidth(2, 190)
+        self.table.horizontalHeader().sectionClicked.connect(self.sort_by_column)
+        self.table.doubleClicked.connect(self.open_selected)
+        self.table.selectionModel().selectionChanged.connect(self.preview_selected)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.library_menu)
+        split.addWidget(self.table)
+
+        details = QFrame()
+        details.setObjectName("libraryPreview")
+        details.setMinimumWidth(240)
+        details.setMaximumWidth(370)
+        right = QVBoxLayout(details)
+        right.setContentsMargins(16, 16, 16, 12)
+        right.setSpacing(8)
+        self.pdf = QPdfDocument(self)
+        self.pdf_buffer = None
+        self.pdf_view = QPdfView()
+        self.pdf_view.setDocument(self.pdf)
+        self.pdf_view.setPageMode(QPdfView.PageMode.SinglePage)
+        self.pdf_view.setFixedHeight(205)
+        self.pdf_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.pdf_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._apply_pdf_background()
+        right.addWidget(self.pdf_view)
+        pdf_tools = QHBoxLayout()
+        pdf_tools.addStretch()
+        pdf_tools.addWidget(icon_button("left", lambda: self.change_pdf_page(-1), "Previous PDF page"))
+        self.pdf_page_label = heading("0 / 0", True)
+        pdf_tools.addWidget(self.pdf_page_label)
+        pdf_tools.addWidget(icon_button("right", lambda: self.change_pdf_page(1), "Next PDF page"))
+        pdf_tools.addWidget(action("−", lambda: self.pdf_zoom(.8), kind="quiet"))
+        pdf_tools.addWidget(action("Fit", self.pdf_fit, kind="quiet"))
+        pdf_tools.addWidget(action("+", lambda: self.pdf_zoom(1.25), kind="quiet"))
+        pdf_tools.addStretch()
+        right.addLayout(pdf_tools)
+        title_row = QHBoxLayout()
+        self.selected_title = heading("Select a document")
+        title_row.addWidget(self.selected_title, 1)
+        title_row.addWidget(icon_button("more", self.library_menu_at_button, "More document actions"))
+        right.addLayout(title_row)
+        self.details = QLabel("Select a document to preview")
+        self.details.setObjectName("meta")
+        self.details.setWordWrap(True)
+        self.details.setMinimumHeight(45)
+        right.addWidget(self.details)
+        self.open_button = action("Open", self.open_selected, primary=True)
+        right.addWidget(self.open_button)
+        row = QHBoxLayout()
+        folder_button = action("Show in folder", self.open_folder)
+        copy_button = action("Export copy", self.export_copy)
+        row.addWidget(folder_button)
+        row.addWidget(copy_button)
+        right.addLayout(row)
+        row = QHBoxLayout()
+        edit_button = action("Edit details", self.edit_selected)
+        delete_button = action("Delete…", self.delete_selected, kind="danger")
+        row.addWidget(edit_button)
+        row.addWidget(delete_button)
+        right.addLayout(row)
+        self.library_actions = (self.open_button, folder_button, copy_button, edit_button, delete_button)
+        for control in self.library_actions:
+            control.setEnabled(False)
+        right.addStretch()
+        split.addWidget(details)
+        split.setSizes([830, 300])
+        outer.addWidget(split, 1)
+        self.stack.addWidget(page)
+
+    def sort_by_column(self, column):
+        options = {0: ("newest", "oldest"), 1: ("az", "za"),
+                   2: ("category_az", "category_za")}
+        pair = options[column]
+        choice = pair[1] if self.sort_filter.currentData() == pair[0] else pair[0]
+        self.sort_filter.setCurrentIndex(self.sort_filter.findData(choice))
+
+    def apply_date_filter(self):
+        choice = self.date_filter.currentData()
+        today = date.today()
+        if choice == "custom":
+            self.advanced_filters()
+            return
+        self.date_from.setText(today.replace(day=1).isoformat() if choice == "month" else
+                               today.replace(month=1, day=1).isoformat() if choice == "year" else "")
+        self.date_to.setText(today.isoformat() if choice in ("month", "year") else "")
+
+    def advanced_filters(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Search filters")
+        form = QFormLayout(dialog)
+        sorting = combo([(self.sort_filter.itemText(i), self.sort_filter.itemData(i))
+                         for i in range(self.sort_filter.count())], self.sort_filter.currentData())
+        date_field = combo([("Document date", "document"), ("Archived date", "archived")],
+                           self.date_field.currentData())
+        from_edit = QLineEdit(self.date_from.text())
+        to_edit = QLineEdit(self.date_to.text())
+        from_edit.setPlaceholderText("YYYY-MM-DD")
+        to_edit.setPlaceholderText("YYYY-MM-DD")
+        form.addRow("Sort", sorting)
+        form.addRow("Date field", date_field)
+        form.addRow("From", from_edit)
+        form.addRow("To", to_edit)
+        controls = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        controls.rejected.connect(dialog.reject)
+        form.addRow(controls)
+        dialog.exec()
+        self.sort_filter.setCurrentIndex(self.sort_filter.findData(sorting.currentData()))
+        self.date_field.setCurrentIndex(self.date_field.findData(date_field.currentData()))
+        self.date_from.setText(from_edit.text().strip())
+        self.date_to.setText(to_edit.text().strip())
+        self.refresh_library()
+
+    def delete_selected(self):
+        record = self.selected_record()
+        if not record:
+            return
+        if Path(record["file_path"]).parent.resolve() == self.archive.documents_dir.resolve():
+            self.delete_managed()
+        else:
+            self.remove_index()
+
+    def _apply_pdf_background(self):
+        if not hasattr(self, "pdf_view"):
+            return
+        background = "#171B22" if self.settings.get("theme") == "dark" else "#E9EDF2"
+        self.pdf_view.setStyleSheet(f"QPdfView, QPdfView QWidget {{ background:{background}; }}")
+        palette = self.pdf_view.palette()
+        for role in (QPalette.ColorRole.Window, QPalette.ColorRole.Base,
+                     QPalette.ColorRole.Dark, QPalette.ColorRole.Mid):
+            palette.setColor(role, QColor(background))
+        self.pdf_view.setPalette(palette)
+        self.pdf_view.viewport().setPalette(palette)
+
+    def _build_settings(self):
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+        top = QFrame()
+        top.setObjectName("topbar")
+        top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(20, 7, 20, 7)
+        top_layout.addWidget(heading("Settings"))
+        top_layout.addStretch()
+        top_layout.addWidget(action("Save settings", self.save_settings, primary=True))
+        page_layout.addWidget(top)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        body = QVBoxLayout(content)
+        body.setContentsMargins(24, 22, 24, 26)
+        body.setSpacing(10)
+        content.setMaximumWidth(800)
+        body.addWidget(heading("General"))
+        body.addWidget(heading("ScaNow keeps scans and document metadata on this computer.", True))
+        body.addSpacing(9)
+        body.addWidget(line())
+        body.addSpacing(8)
+        body.addWidget(heading("Scanner"))
+        body.addWidget(heading("Choose how NAPS2 discovers connected scanners. Scan options are in the workspace toolbar.", True))
+        self.driver = combo([("Auto (TWAIN then WIA)", "auto"), ("TWAIN", "twain"),
+                             ("WIA", "wia")], self.settings.get("driver"))
+        self.naps2_path = QLineEdit(self.settings.get("naps2_path"))
+        self.naps2_path.setPlaceholderText("NAPS2.Console.exe path (auto-detect if blank)")
+        scanner_form = QFormLayout()
+        scanner_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        scanner_form.addRow("Scanner driver", self.driver)
+        scanner_form.addRow("NAPS2 Console", self.naps2_path)
+        body.addLayout(scanner_form)
+        body.addWidget(action("Refresh scanners", self.refresh_scanners))
+        body.addSpacing(8)
+        body.addWidget(line())
+        body.addSpacing(8)
+        body.addWidget(heading("Archive"))
+        body.addWidget(heading("Managed PDFs are stored in the folder below. Metadata is indexed locally.", True))
+        self.library_path = QLineEdit(self.settings.get("library_dir"))
+        archive_form = QFormLayout()
+        archive_form.addRow("Archive folder", self.library_path)
+        body.addLayout(archive_form)
+        archive_actions = QHBoxLayout()
+        archive_actions.addWidget(action("Categories", self.manage_categories))
+        archive_actions.addWidget(action("Check database", self.check_database))
+        archive_actions.addStretch()
+        body.addLayout(archive_actions)
+        body.addSpacing(8)
+        body.addWidget(line())
+        body.addSpacing(8)
+        body.addWidget(heading("Appearance"))
+        self.theme = combo([("Light", "light"), ("Dark", "dark")], self.settings.get("theme"))
+        appearance_form = QFormLayout()
+        appearance_form.addRow("Theme", self.theme)
+        body.addLayout(appearance_form)
+        body.addSpacing(8)
+        body.addWidget(line())
+        body.addSpacing(8)
+        body.addWidget(heading("Backup and recovery"))
+        body.addWidget(heading("Create a portable archive backup or restore a previous backup.", True))
+        backup_actions = QHBoxLayout()
+        backup_actions.addWidget(action("Create backup", self.create_backup))
+        backup_actions.addWidget(action("Restore backup", self.restore_backup))
+        backup_actions.addStretch()
+        body.addLayout(backup_actions)
+        body.addSpacing(8)
+        body.addWidget(line())
+        body.addSpacing(8)
+        body.addWidget(heading("PDF and about"))
+        body.addWidget(heading("PDF import, preview, and export run locally. ScaNow 2.0 uses NAPS2 Console for scanning.", True))
+        body.addStretch()
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll, 1)
+        self.stack.addWidget(page)
